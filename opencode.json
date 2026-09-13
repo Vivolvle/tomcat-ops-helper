@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "mcp": {
+    "tomcat-helper": {
+      "type": "local",
+      "command": ["go", "run", "./cmd/mcpstdio"],
+      "enabled": true,
+      "environment": {
+        "MCP_HTTP_URL": "http://127.0.0.1:7777"
+      }
+    },
+    "outline": {
+      "type": "remote",
+      "url": "http://221.226.123.130:3000/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer ol_api_tggflAcBRs74YgS2pfboCfWwynGK9ItvYlzAwU"
+      }
+    }
+  }
+}
+

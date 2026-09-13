@@ -1,0 +1,36 @@
+{
+  "server_url": "wss://ops.example.com/ws",
+  "token": "REPLACE_WITH_LONG_RANDOM_STRING",
+  "tomcat_home": "C:\\tomcat",
+  "jdk_home": "C:\\jdk-17",
+  "log_dir": "C:\\tomcat\\logs",
+  "allowed_dirs": [
+    "C:\\tomcat",
+    "C:\\tomcat\\logs",
+    "C:\\tomcat\\webapps",
+    "C:\\deploy"
+  ],
+  "command_timeout": 30,
+  "max_output_size": 1048576,
+  "reconnect_interval": 5,
+  "heartbeat_interval": 30,
+  "heartbeat_timeout": 90,
+  "log_file": "helper.log",
+
+  "esb": {
+    "host": "10.0.0.5",
+    "port": 3306,
+    "user": "esb_ro",
+    "password": "REPLACE_ME",
+    "database": "esb"
+  },
+
+  "erp": {
+    "type": "oracle",
+    "host": "10.0.0.6",
+    "port": 1521,
+    "user": "erp_ro",
+    "password": "REPLACE_ME",
+    "database": "ORCL"
+  }
+}

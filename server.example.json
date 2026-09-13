@@ -1,0 +1,9 @@
+{
+  "listen": ":443",
+  "ws_listen": "127.0.0.1:8444",
+  "tls_cert": "C:\\certs\\ops.pem",
+  "tls_key": "C:\\certs\\ops.key",
+  "tokens": ["REPLACE_WITH_LONG_RANDOM_STRING"],
+  "audit_log": "audit.log",
+  "agent_listen": "127.0.0.1:7777"
+}
