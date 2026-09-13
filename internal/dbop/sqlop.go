@@ -24,6 +24,8 @@ type SQLOp struct {
 	driver   string
 	host     string
 	port     int
+	user     string
+	password string
 	database string
 
 	mu      sync.Mutex
@@ -52,6 +54,8 @@ func NewSQLOp(ctx context.Context, cfg *config.DBConfig) (*SQLOp, error) {
 		driver:   driver,
 		host:     host,
 		port:     port,
+		user:     cfg.User,
+		password: cfg.Password,
 		database: database,
 		status: Status{
 			Configured: true,
@@ -165,6 +169,8 @@ func (o *SQLOp) ensureOpenLocked(ctx context.Context) error {
 	dsn, err := buildDSN(o.driver, &config.DBConfig{
 		Host:     o.host,
 		Port:     o.port,
+		User:     o.user,
+		Password: o.password,
 		Database: o.database,
 	})
 	if err != nil {

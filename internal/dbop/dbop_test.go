@@ -2,7 +2,9 @@ package dbop
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -358,6 +360,72 @@ func TestSQLOp_DSNEscapesPassword(t *testing.T) {
 	}
 	if strings.Contains(dsn, "p;w@rd/x?#= &") {
 		t.Fatalf("raw password leaked into DSN: %q", dsn)
+	}
+}
+
+// TestSQLOp_EnsureOpenCarriesCredentials is the regression test for the
+// empty-user/no-password bug: ensureOpenLocked must forward User and
+// Password into buildDSN. Pre-fix, the produced DSN started with ":@tcp("
+// (no user, no password) and MySQL returned "Access denied for user
+// ''@'…' (using password: NO)". Post-fix, the DSN must embed the user
+// and the URL-escaped password.
+func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *config.DBConfig
+	}{
+		{
+			name: "mysql basic",
+			cfg: &config.DBConfig{
+				Host: "h", Port: 3306, User: "root", Password: "123456", Database: "master",
+			},
+		},
+		{
+			name: "mysql password with specials",
+			cfg: &config.DBConfig{
+				Host: "h", Port: 3306, User: "u", Password: "p;w@rd/x?#= &", Database: "d",
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var capturedDSN string
+			fakeOpen := func(driver, dsn string) (*sql.DB, error) {
+				capturedDSN = dsn
+				return nil, errors.New("fake open: stop here, we only want to see the DSN")
+			}
+			op := &SQLOp{
+				driver:   c.cfg.Driver(),
+				host:     c.cfg.Host,
+				port:     c.cfg.EffectivePort(c.cfg.Driver()),
+				user:     c.cfg.User,
+				password: c.cfg.Password,
+				database: c.cfg.Database,
+				open:     fakeOpen,
+				pingTO:   time.Second,
+			}
+			err := op.ensureOpen(context.Background())
+			if err == nil {
+				t.Fatalf("expected fake-open error, got nil")
+			}
+			if capturedDSN == "" {
+				t.Fatalf("open func never called — ensureOpen did not reach buildDSN")
+			}
+			// Must carry the user. Pre-fix this was the leading ':' of ':@tcp(…)'.
+			if !strings.Contains(capturedDSN, c.cfg.User+":") {
+				t.Fatalf("DSN %q does not carry user %q", capturedDSN, c.cfg.User)
+			}
+			// Must carry the URL-escaped password. Pre-fix this was empty between
+			// the ':' and '@tcp(...)' — i.e. the connection went out anonymously.
+			wantPass := url.QueryEscape(c.cfg.Password)
+			if !strings.Contains(capturedDSN, ":"+wantPass+"@") {
+				t.Fatalf("DSN %q does not carry URL-escaped password %q", capturedDSN, wantPass)
+			}
+			// And the empty-user signature must be gone.
+			if strings.HasPrefix(capturedDSN, ":@") {
+				t.Fatalf("DSN %q still has empty-user ':@' prefix — the original bug", capturedDSN)
+			}
+		})
 	}
 }
 
