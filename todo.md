@@ -2,6 +2,8 @@
 
 每条一行，格式：`- [YYYY-MM-DD] <缺什么> — <期望工具名 / 根因>`
 
+- [2026-09-13] ~~LLM 调不到 helper 动态工具（`esb_db_operator` / `erp_db_operator` 等）——~~ **已解决**。mcpstdio 加后台 poller（默认 5s）拉 `/mcp/tools`，工具名指纹变了就 emit `notifications/tools/list_changed`，opencode 按 MCP 规范自动重跑 `tools/list`。新增 `-poll-interval` flag + `MCP_POLL_INTERVAL` env。Bridge stdout 写入加 mutex。测试：`TestFingerprintTools` / `TestWriteNotification_Format` / `TestPoller_EmitsOnChange` / `TestPoller_NoChange_StaysQuiet` / `TestPoller_Disabled`。短期 workaround 仍可用（curl `/mcp/call`），但不再需要。
+
 测试期结束后把高频项收敛进正式需求文档。
 
 ---

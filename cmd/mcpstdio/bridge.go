@@ -12,6 +12,12 @@
 //	ping                 — returns {}
 //
 // Anything else returns a JSON-RPC -32601 method-not-found error.
+//
+// A background poller (see StartPoller) periodically re-fetches /mcp/tools
+// and, when the list changes, pushes a `notifications/tools/list_changed`
+// notification to stdout so the MCP client re-runs `tools/list` and learns
+// about tools that appeared after startup (e.g. an esb_db_operator that the
+// helper only advertises once its MySQL ping succeeds).
 package main
 
 import (
@@ -23,7 +29,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +44,11 @@ var supportedProtocolVersions = []string{
 	"2024-11-05",
 }
 
+// defaultPollInterval is how often the bridge re-checks /mcp/tools. Tuned to
+// be quick enough that operator-driven reconnects are visible within a few
+// seconds, but not so aggressive that we hammer server.exe.
+const defaultPollInterval = 5 * time.Second
+
 // Bridge is a stdio→HTTP MCP relay.
 type Bridge struct {
 	URL      string
@@ -44,6 +57,21 @@ type Bridge struct {
 
 	serverName    string
 	serverVersion string
+
+	// pollInterval controls how often StartPoller re-checks /mcp/tools. Zero
+	// disables polling entirely; -1 falls back to defaultPollInterval.
+	PollInterval time.Duration
+
+	// stdout / out are set by Serve before any goroutines start, so plain
+	// assignments from Serve are safe; subsequent writes from the Serve loop
+	// and the poller goroutine must hold outMu.
+	stdout io.Writer
+	out    *json.Encoder
+	outMu  sync.Mutex
+
+	// lastFingerprint is the last tool-name fingerprint the poller observed.
+	// The first successful poll seeds it without firing a notification.
+	lastFingerprint string
 }
 
 // NewBridge returns a Bridge wired with sensible defaults: a 60s HTTP client
@@ -56,6 +84,7 @@ func NewBridge(rawURL, clientID string) *Bridge {
 		HTTP:          &http.Client{Timeout: 60 * time.Second},
 		serverName:    "tomcat-ops-helper-bridge",
 		serverVersion: "0.1.0",
+		PollInterval:  defaultPollInterval,
 	}
 }
 
@@ -72,6 +101,16 @@ func (b *Bridge) Serve(stdin io.Reader, stdout, stderr io.Writer) error {
 
 	out := json.NewEncoder(stdout)
 	out.SetEscapeHTML(false)
+
+	// Expose out/stdout to the poller goroutine; must happen before StartPoller.
+	b.stdout = stdout
+	b.out = out
+
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	defer pollCancel()
+	if b.PollInterval > 0 {
+		b.StartPoller(pollCtx, stderr)
+	}
 
 	for in.Scan() {
 		line := bytesTrim(in.Bytes())
@@ -247,9 +286,11 @@ func (b *Bridge) handleToolsCall(req *jsonrpcRequest, out *json.Encoder, stderr 
 			string(trimmed))
 		return
 	}
+	b.outMu.Lock()
 	if err := out.Encode(resp2); err != nil {
 		fmt.Fprintf(stderr, "bridge: write response: %v\n", err)
 	}
+	b.outMu.Unlock()
 }
 
 // fetchTools returns the tool list for whichever helper the bridge is
@@ -359,6 +400,8 @@ func (b *Bridge) getJSON(ctx context.Context, path string) ([]byte, error) {
 // writeOK writes a JSON-RPC success response. A broken stdout is logged and
 // swallowed; the bridge cannot meaningfully recover.
 func (b *Bridge) writeOK(out *json.Encoder, id json.RawMessage, result any) {
+	b.outMu.Lock()
+	defer b.outMu.Unlock()
 	if err := out.Encode(jsonrpcResponse{
 		JSONRPC: "2.0", ID: id, Result: result,
 	}); err != nil {
@@ -368,12 +411,96 @@ func (b *Bridge) writeOK(out *json.Encoder, id json.RawMessage, result any) {
 
 // writeErr writes a JSON-RPC error response.
 func (b *Bridge) writeErr(out *json.Encoder, id json.RawMessage, code int, msg, data string) {
+	b.outMu.Lock()
+	defer b.outMu.Unlock()
 	if err := out.Encode(jsonrpcResponse{
 		JSONRPC: "2.0", ID: id,
 		Error: &jsonrpcError{Code: code, Message: msg, Data: data},
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "bridge: write error: %v\n", err)
 	}
+}
+
+// writeNotification pushes a server→client JSON-RPC notification (no id, no
+// result). Used by StartPoller to tell the MCP client that the helper tool
+// list has changed. The encoder is shared with the Serve loop so the lock
+// is required.
+func (b *Bridge) writeNotification(method string, params any) {
+	if b.out == nil {
+		return
+	}
+	body := map[string]any{"jsonrpc": "2.0", "method": method}
+	if params != nil {
+		body["params"] = params
+	}
+	b.outMu.Lock()
+	defer b.outMu.Unlock()
+	if err := b.out.Encode(body); err != nil {
+		fmt.Fprintf(os.Stderr, "bridge: write notification: %v\n", err)
+	}
+}
+
+// fingerprintTools returns a stable signature for a tool list — just the
+// sorted, comma-joined names. Two equal signatures mean the client already
+// knows everything; different signatures mean we should re-notify.
+func fingerprintTools(tools []toolMeta) string {
+	names := make([]string, len(tools))
+	for i, t := range tools {
+		names[i] = t.Name
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
+}
+
+// StartPoller spawns a background goroutine that periodically re-fetches
+// /mcp/tools and, when the tool list changes, emits
+// `notifications/tools/list_changed` so the MCP client re-runs `tools/list`.
+//
+// The first successful poll only seeds the fingerprint (no notification),
+// because the client already knows the current state from its initial
+// `tools/list` call. Subsequent polls compare and notify on change.
+//
+// Set Bridge.PollInterval to 0 before calling Serve to disable polling.
+func (b *Bridge) StartPoller(ctx context.Context, stderr io.Writer) {
+	interval := b.PollInterval
+	if interval <= 0 {
+		return
+	}
+	go func() {
+		// Seed: first successful fetch captures the current state silently.
+		if tools, err := b.fetchTools(ctx, stderr); err == nil {
+			b.outMu.Lock()
+			b.lastFingerprint = fingerprintTools(tools)
+			b.outMu.Unlock()
+		} else {
+			fmt.Fprintf(stderr, "mcpstdio: initial tools poll: %v\n", err)
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				tools, err := b.fetchTools(ctx, stderr)
+				if err != nil {
+					fmt.Fprintf(stderr, "mcpstdio: tools poll: %v\n", err)
+					continue
+				}
+				fp := fingerprintTools(tools)
+				b.outMu.Lock()
+				changed := fp != b.lastFingerprint
+				if changed {
+					b.lastFingerprint = fp
+				}
+				b.outMu.Unlock()
+				if changed {
+					b.writeNotification("notifications/tools/list_changed", nil)
+				}
+			}
+		}
+	}()
 }
 
 // jsonrpcRequest is the subset of JSON-RPC 2.0 this bridge accepts.

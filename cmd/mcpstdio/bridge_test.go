@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // fakeServer simulates server.exe's /mcp/* endpoints. The /mcp/tools
@@ -23,6 +24,10 @@ type fakeServer struct {
 
 	toolsMode atomic.Value // "single", "multi", "none"
 	pinnedID  atomic.Value // string
+
+	// toolsFn, if non-nil, returns the per-call tool list. Tests use this
+	// to simulate helpers joining/leaving or advertising new tools.
+	toolsFn atomic.Value // func() []toolMeta
 
 	callMode atomic.Value // "ok", "tool-error", "non-json"
 }
@@ -42,7 +47,17 @@ func newFakeServer(t *testing.T) *fakeServer {
 	return f
 }
 
+func (f *fakeServer) currentTools() []toolMeta {
+	if v := f.toolsFn.Load(); v != nil {
+		if fn, ok := v.(func() []toolMeta); ok {
+			return fn()
+		}
+	}
+	return cannedTools
+}
+
 func (f *fakeServer) handleTools(w http.ResponseWriter, r *http.Request) {
+	tools := f.currentTools()
 	if cid := r.URL.Query().Get("client_id"); cid != "" {
 		// Pinned view.
 		if cid != f.pinnedID.Load().(string) {
@@ -51,7 +66,7 @@ func (f *fakeServer) handleTools(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"client_id": cid,
-			"tools":     cannedTools,
+			"tools":     tools,
 		})
 		return
 	}
@@ -61,14 +76,14 @@ func (f *fakeServer) handleTools(w http.ResponseWriter, r *http.Request) {
 	case "single":
 		writeJSON(w, http.StatusOK, map[string]any{
 			"clients": []map[string]any{
-				{"client_id": f.pinnedID.Load().(string), "tools": cannedTools},
+				{"client_id": f.pinnedID.Load().(string), "tools": tools},
 			},
 		})
 	case "multi":
 		writeJSON(w, http.StatusOK, map[string]any{
 			"clients": []map[string]any{
-				{"client_id": "helper-A", "tools": cannedTools},
-				{"client_id": "helper-B", "tools": cannedTools},
+				{"client_id": "helper-A", "tools": tools},
+				{"client_id": "helper-B", "tools": tools},
 			},
 		})
 	default:
@@ -124,10 +139,21 @@ var cannedTools = []toolMeta{
 }
 
 // runBridge feeds `input` line-by-line into a Bridge pointed at the fake
-// server, returns whatever ended up on stdout and stderr.
+// server, returns whatever ended up on stdout and stderr. The background
+// tools poller is disabled by default — tests that exercise it should call
+// runBridgePoll instead.
 func runBridge(t *testing.T, f *fakeServer, input string, clientID string) (string, string) {
 	t.Helper()
+	return runBridgePoll(t, f, input, clientID, 0)
+}
+
+// runBridgePoll is runBridge with a non-zero poll interval. The caller is
+// responsible for ensuring the fake server stays alive for the full poll
+// cycle (or accepts shutdown without panicking).
+func runBridgePoll(t *testing.T, f *fakeServer, input string, clientID string, poll time.Duration) (string, string) {
+	t.Helper()
 	b := NewBridge(f.URL, clientID)
+	b.PollInterval = poll
 	stdin := strings.NewReader(input)
 	var out, errOut bytes.Buffer
 	if err := b.Serve(stdin, &out, &errOut); err != nil {
@@ -373,7 +399,7 @@ func TestBridge_Run_DefaultsAndFlags(t *testing.T) {
 	// (we are only testing the wiring, not the round-trip).
 	t.Setenv("MCP_HTTP_URL", "http://127.0.0.1:1")
 	t.Setenv("MCP_CLIENT_ID", "wired-id")
-	if err := run("", "", &stdin, &stdout, &stderr); err != nil {
+	if err := run("", "", 0, &stdin, &stdout, &stderr); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if !strings.Contains(stderr.String(), "client_id=wired-id") {
@@ -402,5 +428,142 @@ func TestBridge_StderrIsClean(t *testing.T) {
 	if !strings.Contains(stderr, "no helper") {
 		// not a hard requirement; just sanity that we logged nothing spurious
 		_ = fmt.Sprintf("stderr = %q", stderr)
+	}
+}
+
+func TestFingerprintTools(t *testing.T) {
+	got := fingerprintTools([]toolMeta{
+		{Name: "status"},
+		{Name: "exec"},
+		{Name: "tail"},
+	})
+	if got != "exec,status,tail" {
+		t.Fatalf("fingerprint = %q, want %q", got, "exec,status,tail")
+	}
+	// Empty list → empty string.
+	if got := fingerprintTools(nil); got != "" {
+		t.Fatalf("fingerprint(nil) = %q", got)
+	}
+}
+
+func TestWriteNotification_Format(t *testing.T) {
+	b := NewBridge("http://127.0.0.1:1", "")
+	b.stdout = &bytes.Buffer{}
+	b.out = json.NewEncoder(b.stdout)
+	b.out.SetEscapeHTML(false)
+
+	b.writeNotification("notifications/tools/list_changed", nil)
+	var msg map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace([]byte(b.stdout.(*bytes.Buffer).String())), &msg); err != nil {
+		t.Fatalf("decode notification: %v: %q", err, b.stdout)
+	}
+	if msg["jsonrpc"] != "2.0" {
+		t.Fatalf("jsonrpc = %v", msg["jsonrpc"])
+	}
+	if msg["method"] != "notifications/tools/list_changed" {
+		t.Fatalf("method = %v", msg["method"])
+	}
+	if _, hasID := msg["id"]; hasID {
+		t.Fatalf("notification must not carry id: %v", msg)
+	}
+}
+
+// TestPoller_EmitsOnChange feeds the bridge three tools/list requests while
+// mutating the fake server's advertised tools between the second and third
+// polls. The poller should NOT emit a notification after the initial seed
+// poll, then SHOULD emit exactly one when the helper's tool list changes.
+func TestPoller_EmitsOnChange(t *testing.T) {
+	f := newFakeServer(t)
+
+	// Make the fake server's tool list mutable: initial = cannedTools,
+	// after one flip = cannedTools + esb_db_operator.
+	var flipped atomic.Bool
+	f.toolsFn.Store(func() []toolMeta {
+		if flipped.Load() {
+			return append(append([]toolMeta{}, cannedTools...), toolMeta{
+				Name:        "esb_db_operator",
+				Description: "added later",
+				InputSchema: json.RawMessage(`{"type":"object"}`),
+			})
+		}
+		return cannedTools
+	})
+
+	// Use a pipe for stdin so we can keep it open across multiple poll
+	// cycles. The bridge will read the initial tools/list frame and then
+	// block on Read until we close the writer.
+	pr, pw := io.Pipe()
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	b := NewBridge(f.URL, "")
+	b.PollInterval = 50 * time.Millisecond
+
+	// Send the initial tools/list frame.
+	go func() {
+		_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}` + "\n"))
+	}()
+
+	// Flip the tools after the initial seed poll has run (50ms) but before
+	// the second tick (100ms), then close stdin to let Serve exit cleanly.
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		flipped.Store(true)
+		// Wait long enough for the change poll to fire and write the
+		// notification, then close stdin.
+		time.Sleep(200 * time.Millisecond)
+		_ = pw.Close()
+	}()
+
+	if err := b.Serve(pr, stdout, stderr); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	// The captured stdout must contain: (1) the tools/list response, and
+	// (2) the notifications/tools/list_changed line.
+	out := stdout.String()
+	if !strings.Contains(out, `"id":1`) {
+		t.Fatalf("missing tools/list response: %q", out)
+	}
+	if c := strings.Count(out, `"notifications/tools/list_changed"`); c != 1 {
+		t.Fatalf("expected exactly 1 list_changed notification, got %d in:\n%s", c, out)
+	}
+}
+
+// TestPoller_NoChange_StaysQuiet feeds the bridge the same tool list across
+// every poll and asserts no notification is emitted.
+func TestPoller_NoChange_StaysQuiet(t *testing.T) {
+	f := newFakeServer(t)
+
+	pr, pw := io.Pipe()
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	b := NewBridge(f.URL, "")
+	b.PollInterval = 50 * time.Millisecond
+
+	go func() {
+		_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}` + "\n"))
+		// Wait through several poll cycles then close.
+		time.Sleep(250 * time.Millisecond)
+		_ = pw.Close()
+	}()
+
+	if err := b.Serve(pr, stdout, stderr); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if strings.Contains(stdout.String(), "tools/list_changed") {
+		t.Fatalf("did not expect a notification, got: %q", stdout.String())
+	}
+}
+
+// TestPoller_Disabled keeps the contract that PollInterval=0 disables polling.
+func TestPoller_Disabled(t *testing.T) {
+	f := newFakeServer(t)
+	stdout, _ := runBridgePoll(t, f,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`+"\n",
+		"", 0)
+	if strings.Contains(stdout, "list_changed") {
+		t.Fatalf("disabled poller should not emit: %q", stdout)
 	}
 }
