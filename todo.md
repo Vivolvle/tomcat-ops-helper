@@ -179,3 +179,152 @@
 
 - [ ] 用真实 MySQL 跑一次：helper 启动 → `esb_db_operator` 发 `SELECT 1` → 看到行。
 - [ ] 真实 Oracle / SQL Server 在客户机上首次启用时跑一次。
+
+---
+
+# 实战痛点 & 改进项（2026-09-14 客户机首次端到端）
+
+按"是否要改本项目代码"分类。一次性记下来，避免每次踩同样的坑。
+
+## A. 真 bug —— 本项目要改
+
+- [x] **A1 — `buildDSN` 用 `url.QueryEscape` 编密码，导致 mysql_native_password 1045**
+  现象：helper 启动时 ping MySQL 报 `Access denied (using password: YES)`，但手工
+  `mysql -uroot -pyc1234!` 同一密码能连。`yc1234!` 里 `!` 被 `QueryEscape` 编成 `%21`，
+  整个 7 字节 `yc1234!` 变成 8 字节字面值 `yc1234%21`，server 哈希对不上。
+  fix：新增 `mysqlDSNEscape`，只 escape DSN userinfo 分隔符（`@` 和 `:`），其它字符原样
+  透传。`mysql` / `oracle` 两个分支都改；`sqlserver` 走 `url.Values`，不受影响。
+  dbop_test.go 加 `TestSQLOp_DSNPreservesExclamation` 回归。**已修**，helper.exe 已重打。
+
+- [ ] **A2 — dbop_test.go 原来那条 `p%3Bw%40rd…` 断言本身就是错的**
+  发现 A1 的过程里看到：`TestSQLOp_EnsureOpenCarriesCredentials` 期望 password 用
+  `url.QueryEscape` 编码（line 440 那行 `wantPass := url.QueryEscape(c.cfg.Password)`）。
+  这是当时实现自带回归测试，不是验 DSN 格式、而是验"必须有 escape"。意味着
+  QueryEscape 这个错误选型**从一开始就没被测到**。值得回查 PR/commit，看是啥时候
+  引入的；同时把 `TestSQLOp_DSNPreservesExclamation` 的 `wantPass` 写法跟 `mysqlDSNEscape`
+  绑死，以后改 escape 策略测试会跟着红。
+
+## B. 实操体验 —— 本项目要改 / 增强
+
+- [ ] **B1 — `validate_config` action**
+  痛点：改完 config.json 后，helper 不监听文件变更、不重读，只能看启动日志里的
+  warn 行才能知道连不连得上。期望：加一个 `validate_config` action，**不重连 DB**，
+  只回显当前 helper 进程实际读到的 esb/erp 配置（host/port/user/database，password 脱敏为
+  `***`），并对每个 connector 跑一次 ping。LLM 端：改 config → 重启 helper → 调
+  `validate_config` → 看 ping 结果。这样改错密码的反馈从"重启后翻日志"变成"一次工具调用"。
+
+- [ ] **B3 — DSN 参数文档化**
+  现状：MySQL DSN 只有 `parseTime=true&charset=utf8mb4&timeout=10s&readTimeout=30s&writeTimeout=30s`。
+  MySQL 8 默认 `caching_sha2_password`，用户若是这条 + 老 go driver 版本会握手失败。
+  当前我们用 `mysql_native_password` 所以 OK。期望：docs/设计文档.md §13 加一段
+  说明这个权衡，并给出"客户端需要 native password 时"的 workaround（DB 侧
+  `ALTER USER … IDENTIFIED WITH mysql_native_password BY '…'`）。**纯文档**。
+
+- [ ] **B4 — `kill_zombie` 工具在改完 helper 后做端到端测试**
+  本次没用到，但 status / kill_zombie / replace_jar / regen_service / restart 这些
+  工具都没在这次实战中走过。需要排个简单的脚本走一遍。
+
+## C. exec 工具的封装坑 —— 本项目要改
+
+- [ ] **C1 — exec 对 cmd /C + 路径含空格的 tokenize 不稳**
+  实战中：`cmd /C "if not exist \"D:\\MySql\\MySQL Server 8.0\\Data\""` 直接被 exec
+  当作字面命令跑（引号丢），work_dir 还附加到前面。当前 exec 用 `cmd /C <cmd>`，
+  cmd 自己再 tokenize 一次。期望：exec 在收到命令时，如果第一个 token 是 cmd /C / powershell /
+  pwsh 之类，自己做一层 escape 或者干脆在 helper 里**先 `powershell -NoProfile -Command "<user-cmd>"`**
+  把所有用户命令都包成 PS -Command（PS 对引号处理更稳）。也可以加个 flag：
+  `cmd: "powershell"` 让 exec 走 powershell 路径，绕开 cmd tokenize。
+
+- [ ] **C2 — exec 不接受 shell 重定向 / 管道**
+  `command 2>&1` 被 exec 当成命令的一部分传给 mysql 当 db 名（mysql 报 1049 unknown
+  database）。当前 exec 是 `cmd /C <cmd>` 但 cmd 重定向已经被吃。期望：文档化
+  "exec 不支持 shell 重定向 / 管道 / &"；如果用户需要，改用 powershell -File
+  跑自定义 ps1 脚本（这是 AGENTS.md 的推荐做法）。在 tools.go 给 `exec` tool
+  description 加一段说明。
+
+- [ ] **C3 — PowerShell `$host` 等保留变量在用户 ps1 里**
+  不是我代码问题，但既然实战踩了，AGENTS.md 加一行：
+  「PowerShell 单引号字符串里 `\` 是字面字符，`\\` 才是两个字符」+「避免用 `$host`
+  / `$args` / `$input` / `$matches` / `$PSItem` / `$null` 等保留名做变量」。
+
+## D. 流程 / 文档 —— 本项目 AGENTS.md / docs 要补
+
+- [ ] **D1 — helper.exe 部署 checklist**
+  实战里每次改完 helper 源码都要：
+  1. 本地 `go test ./...`
+  2. 本地 `go build -ldflags="-s -w" -o bin\helper.exe .\cmd\helper`
+  3. 复制到 `D:\tools\helper-client\helper.exe`（操作员本机）
+  4. 把新版拷到客户机 `D:\bs-esb\helper-client\helper.exe`（覆盖旧版）
+  5. 停旧 helper（taskkill / sc），启动新 helper（run-helper.ps1）
+  6. 看启动日志有没有 "esb_db_operator connected" / "erp_db_operator connected"
+  7. （可选）调 `validate_config` ping 一次
+
+  AGENTS.md 加一个 "Deploying a new helper.exe" 段，包含 sha256 校验方法。
+  当前版本号 helper.log 里有 `helper 0.1.0 starting`，可以借此核对新旧。
+
+- [ ] **D2 — 把"datadir 迁移 / my.ini 改 / 服务启停"这类实战脚本沉淀到 D:\bs-esb\helper-client\**
+  实战里我写了 `robocopy_data.ps1` / `patch_myini.ps1` / `patch_config.ps1` /
+  `patch_erp.ps1` 等等。helper-client 目录可以有一个 `scripts/` 子目录放这些，
+  命名清晰（`01-stop-mysql.ps1` / `02-robocopy-data.ps1` / ...）。下次同类活
+  直接复用。**纯组织工作**。
+
+- [ ] **D3 — todo.md 自身的清洁**
+  现在 todo.md 已经有两份"完成"的 plan（FR-8 dbop + upload_file），实战痛点
+  是新一类。考虑分文件：`todo.md`（MCP gap）、`docs/实战日志.md`（本次及以后
+  实战端到端记录）、`docs/改进 backlog.md`（A/B/C/D 这批）。
+
+## 优先级建议（自我进化这一轮）
+
+只做 **A2** + **B1** + **C1** + **D1**：
+- A2 — 一行测试断言的事，防止回归
+- B1 — 加 `validate_config` action，下次改密码不再盲等重启
+- C1 — 给 exec 加 powershell 路径，避免 cmd tokenize 翻车
+- D1 — 文档化部署流程，下次不靠脑子
+
+其余留 backlog，下次实战 / 复盘再决定。
+
+---
+
+# 2026-09-14 第二次实战补丁
+
+## E. 上次自我进化漏掉的回归坑（已修）
+
+- [x] **E1 — execSchema 的 description 里有未转义的 `"`，整个 ToolList 变非法 JSON**
+  现象：helper 启动后 esb_db_operator / erp_db_operator 都连上（说明 DB 端 OK），
+  但 wsclient PostConnect 写 ToolList 时 server 端报 `invalid character 'S' after
+  object key:value pair`，每 5s 重连一次。
+  根因：上一轮我给 `execSchema` 的 `shell` 字段 description 里写了
+  ``"…wraps the command in `powershell … \"Set-Location '<work_dir>'; <cmd>\"` …"`` —
+  反引号 raw string 里 `\"` 是两个字面字符（反斜杠+引号），**JSON 解析时那对 `"`
+  提前结束了 description string**，剩下的 `\` 当成 JSON 顶层 token，'S' 是 `Set-` 的 'S'。
+  fix：把 description 里的伪 inline 例子换成语义化文字，去掉嵌入反引号 / 嵌套引号。
+  顺手加了 `TestTools_SchemasAreValidJSON` —— 跑 `json.Unmarshal` 验证每个 Tool
+  的 `inputSchema` 都是合法 JSON 对象，**任何 schema 出错都立刻红**。
+
+  **反思**：之前"全量 test + vet"没抓到这个，因为我的断言都是行为级，没验
+  schema 文本本身的合法性。**新增静态校验**。
+
+- [ ] **E2 — 自我进化完没真跑一遍 "Tools() 全列出来" 的端到端验**
+  本次问题在 PostConnect 阶段才会暴露（连 DB 之前）。我没有"helper 启动 →
+  立即通过 MCP 调 `tools/list`"的本地冒烟测试，导致第一次实战就翻车。
+  期望：在 `cmd/helper/main.go` 加一个 `cmd/helper/dump_tools.go` 子命令（不是
+  helper 正常运行时用的，只是开发期工具）`go run ./cmd/helper dump-tools` 把
+  Tools() 列表 + 每个 schema 渲染到 stdout，方便人眼 review。
+  也可以在 `dispatch_test.go` 里加一条 TestPostConnectToolList_IsValidJSON
+  端到端跑 PostConnect，断言 wsserver 收到的 envelope.ToolMeta[i].InputSchema
+  都能 Unmarshal。
+
+## F. 这次实战还没修、但可能相关的
+
+- [ ] **F1 — 服务器端 Hello 接收 vs PostConnect 顺序**
+  当前 helper 是"先发 Hello → 然后 PostConnect 里发 ToolList"。如果 server 期望
+  收到 ToolList 之前先 ACK Hello，而 helper 在 ACK 之前就把 ToolList 写出去，
+  server 可能因为 protocol race 把 ToolList 当成下一帧的某个 message type 报错。
+  这条需要看 server 的协议处理代码确认，不能瞎猜。
+
+## 增量 todo（保持简洁，跟踪就行）
+
+- E1 ✅ 已修 + 防回归
+- E2 写个 dump-tools 子命令 / TestPostConnectToolList_IsValidJSON
+- F1 看 server 协议处理
+
+

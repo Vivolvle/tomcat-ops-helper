@@ -356,6 +356,38 @@ undo that. The server has no per-tool logic; it only relays.
   for malformed JSON-RPC frames themselves (`-32700` parse error). Clients
   must inspect `response.error`, not `response.status_code`.
 
+## Deploying a new helper.exe
+
+Whenever helper source changes (new tool, bug fix, config reload
+support, etc.), go through this checklist end-to-end. Skipping steps
+leads to "I edited config.json but the new password doesn't work"
+ghost bugs.
+
+1. **Local build + test** — `go test -count=1 -timeout 60s ./...`
+   then `go build -ldflags="-s -w" -o bin\helper.exe .\cmd\helper`.
+2. **Copy to operator box staging dir** — `D:\tools\helper-client\helper.exe`
+   (the path the operator uses to hand off to the customer). Verify
+   sha256: `Get-FileHash 'D:\tools\helper-client\helper.exe'`.
+3. **Hand off to customer box** — copy to `D:\bs-esb\helper-client\helper.exe`
+   on the helper host. Same sha256 expected.
+4. **Restart helper** — kill the running `helper.exe` (taskkill /F
+   /IM helper.exe, or close the run-helper.ps1 console), then start
+   `D:\bs-esb\helper-client\run-helper.ps1`.
+5. **Verify startup log** — should see
+   `info: esb_db_operator connected (...)` and
+   `info: erp_db_operator connected (...)`. If either says
+   `startup ping failed: ...`, the config.json password is wrong;
+   fix and go back to step 4.
+6. **Optional: run `validate_config`** — once it shows up in MCP
+   tools, call it to get the same startup snapshot plus every
+   allowed_dirs entry existence check. Useful when you can't tell
+   whether a config change took effect.
+
+`config.json` changes (`tomcat_home`, `jdk_home`, `log_dir`,
+`allowed_dirs`, `esb.*`, `erp.*`) require **steps 4–6** but not
+1–3 — helper reads config.json at startup. There is no SIGHUP /
+file-watch / hot-reload; a restart is the only way.
+
 ## Common traps
 
 - `go build ./...` ignores the `-ldflags` defaults; helper.exe will get the
@@ -368,7 +400,23 @@ undo that. The server has no per-tool logic; it only relays.
 - Server's `tls_cert`/`tls_key` must be PEM-encoded. `cmd/gencert` writes both.
 - `cfg.Validate` falls back to defaults for zero-value timeouts/sizes; tests
   that build `HelperConfig` directly do **not** need to set heartbeat fields.
+- `wsclient.Options.WriteTimeout` defaults to 10s; if you ever override it
+  with `0` the heartbeat write will fail with `i/o timeout` every 30s.
 - The `dispatch` in `cmd/helper/main.go` does not return errors to the WS
   layer; failures become `Result{Success:false, Error: msg}`.
 - Tests touching `t.TempDir()` with sub-20ms gaps can produce identical mtimes;
   add `time.Sleep(20ms)` between writes when sorting by mtime.
+- `exec` runs the user's command via cmd /C on Windows, which means
+  paths with spaces get re-tokenized and quoted-away. For complex
+  scripts (multi-line, cmdlets, anything with single-quotes), pass
+  `"shell":"powershell"` to wrap the command in
+  `powershell -NoProfile -NonInteractive -Command "Set-Location '…'; <cmd>"`,
+  or write the script to a file via `write_file` and run that.
+  `exec` does NOT support shell redirects (`2>&1`) or pipes
+  (`cmd | other`) — Go's `os/exec` runs the program directly, no
+  shell in between.
+- PowerShell variable name collision: `$host`, `$args`, `$input`,
+  `$matches`, `$PSItem`, `$null` are reserved. Avoid them as PS script
+  variable names. PowerShell single-quoted strings are literal —
+  `'D:\bs-esb'` is 8 chars; `'D:\\bs-esb'` is 9 chars. The difference
+  matters when matching against file content.
