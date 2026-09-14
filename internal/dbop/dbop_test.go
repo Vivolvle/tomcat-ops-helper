@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -353,13 +352,33 @@ func TestSQLOp_DSNEscapesPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, frag := range []string{"p%3Bw", "p%3Bw%40rd"} {
-		if !strings.Contains(dsn, frag) && !strings.Contains(dsn, "p%3Bw") {
-			t.Fatalf("DSN should URL-escape password, got %q", dsn)
-		}
+	// mysqlDSNEscape only touches '@' and ':' in userinfo. Other special
+	// chars (';', '/', '?', '#', '=', ' ', '&') must pass through verbatim
+	// so the server's handshake compares the same bytes against the hash.
+	if !strings.Contains(dsn, "u:p;w%40rd/x?#= &") {
+		t.Fatalf("DSN must keep password bytes verbatim except for '@' (and ':'), got %q", dsn)
 	}
-	if strings.Contains(dsn, "p;w@rd/x?#= &") {
-		t.Fatalf("raw password leaked into DSN: %q", dsn)
+	// The raw '@' inside the password must be escaped, otherwise
+	// go-sql-driver would treat everything after it as the host.
+	if strings.Contains(dsn, "u:p;w@rd") {
+		t.Fatalf("DSN must escape '@' in userinfo, got %q", dsn)
+	}
+}
+
+func TestSQLOp_DSNPreservesExclamation(t *testing.T) {
+	// Regression: url.QueryEscape would turn 'yc1234!' into 'yc1234%21'
+	// and mysql_native_password would reject the password with 1045.
+	// mysqlDSNEscape must keep '!' verbatim.
+	cfg := &config.DBConfig{Host: "localhost", Port: 3306, User: "root", Password: "yc1234!", Database: "master"}
+	dsn, err := buildDSN("mysql", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dsn, "root:yc1234!@tcp(localhost:3306)/master") {
+		t.Fatalf("DSN must keep '!' verbatim in userinfo, got %q", dsn)
+	}
+	if strings.Contains(dsn, "%21") {
+		t.Fatalf("DSN must NOT encode '!' as %%21, got %q", dsn)
 	}
 }
 
@@ -384,6 +403,22 @@ func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
 			name: "mysql password with specials",
 			cfg: &config.DBConfig{
 				Host: "h", Port: 3306, User: "u", Password: "p;w@rd/x?#= &", Database: "d",
+			},
+		},
+		{
+			// Regression: if mysqlDSNEscape ever forgets ':', the password
+			// would split into user/pass and the server would see the wrong
+			// hash. Must escape both ':' and '@'.
+			name: "mysql password with both delimiters",
+			cfg: &config.DBConfig{
+				Host: "h", Port: 3306, User: "u", Password: "p:a@s:s", Database: "d",
+			},
+		},
+		{
+			// The real-world password from 2026-09-14 customer box.
+			name: "mysql yc1234!",
+			cfg: &config.DBConfig{
+				Host: "h", Port: 3306, User: "root", Password: "yc1234!", Database: "dev-bs-esb1",
 			},
 		},
 	}
@@ -415,11 +450,13 @@ func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
 			if !strings.Contains(capturedDSN, c.cfg.User+":") {
 				t.Fatalf("DSN %q does not carry user %q", capturedDSN, c.cfg.User)
 			}
-			// Must carry the URL-escaped password. Pre-fix this was empty between
-			// the ':' and '@tcp(...)' — i.e. the connection went out anonymously.
-			wantPass := url.QueryEscape(c.cfg.Password)
+			// Must carry the password verbatim except for the DSN delimiters
+			// '@' and ':' (which mysqlDSNEscape escapes). url.QueryEscape
+			// would turn '!' into '%21' and mysql_native_password would
+			// reject the connection with 1045.
+			wantPass := mysqlDSNEscape(c.cfg.Password)
 			if !strings.Contains(capturedDSN, ":"+wantPass+"@") {
-				t.Fatalf("DSN %q does not carry URL-escaped password %q", capturedDSN, wantPass)
+				t.Fatalf("DSN %q does not carry password %q", capturedDSN, wantPass)
 			}
 			// And the empty-user signature must be gone.
 			if strings.HasPrefix(capturedDSN, ":@") {

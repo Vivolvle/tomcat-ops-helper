@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -379,6 +380,23 @@ func containsFold(haystack, needle string) bool {
 	return false
 }
 
+// mysqlDSNEscape escapes only the characters that would break the
+// go-sql-driver/mysql DSN parser in the userinfo segment (':' and '@').
+// Every other byte — including '!', ';', '/', '?', '#', '=', '&', ' ',
+// '*', '\'', '(', ')' — must be passed through verbatim because the
+// server's native-password handshake compares the received string
+// byte-for-byte against the stored hash. Encoding '!' as '%21' (which
+// url.QueryEscape does) makes the server see the literal six-byte
+// string "yc1234%21" instead of the seven-byte "yc1234!" and
+// authentication fails with 1045.
+func mysqlDSNEscape(s string) string {
+	r := strings.NewReplacer(
+		"@", "%40",
+		":", "%3A",
+	)
+	return r.Replace(s)
+}
+
 // buildDSN constructs the driver-specific connection string. The
 // password is URL-encoded so special characters (e.g. ';', '@', '/',
 // '?', '#') don't break parsing.
@@ -387,8 +405,15 @@ func buildDSN(driver string, cfg *config.DBConfig) (string, error) {
 	switch driver {
 	case "mysql":
 		// go-sql-driver/mysql DSN: user:pass@tcp(host:port)/db?...
-		user := url.QueryEscape(cfg.User)
-		pass := url.QueryEscape(cfg.Password)
+		// The driver parses userinfo as a single chunk between the first
+		// ':' and the '@'; anything else (including '!', ';', '/', '?')
+		// is passed verbatim to the server's handshake, which compares it
+		// against the stored hash byte-for-byte. So we must only escape
+		// the two delimiters ('@' and ':') and leave every other character
+		// intact. url.QueryEscape would turn '!' into '%21' and the server
+		// would reject the password.
+		user := mysqlDSNEscape(cfg.User)
+		pass := mysqlDSNEscape(cfg.Password)
 		host := cfg.Host
 		if port > 0 {
 			host = fmt.Sprintf("%s:%d", cfg.Host, port)
@@ -412,8 +437,11 @@ func buildDSN(driver string, cfg *config.DBConfig) (string, error) {
 		return q.Encode(), nil
 	case "oracle":
 		// sijms/go-ora/v2 DSN: oracle://user:pass@host:port/service_name
-		user := url.QueryEscape(cfg.User)
-		pass := url.QueryEscape(cfg.Password)
+		// Same rule as mysql: only escape DSN delimiters in userinfo;
+		// leave the password otherwise verbatim so '!' and friends reach
+		// the server unchanged.
+		user := mysqlDSNEscape(cfg.User)
+		pass := mysqlDSNEscape(cfg.Password)
 		host := cfg.Host
 		if port > 0 {
 			host = fmt.Sprintf("%s:%d", cfg.Host, port)
