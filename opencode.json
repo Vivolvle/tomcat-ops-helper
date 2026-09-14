@@ -2,6 +2,14 @@
   "$schema": "https://opencode.ai/config.json",
   "instructions": ["AGENTS.md"],
   "mcp": {
+    "tomcat-helper": {
+      "type": "local",
+      "command": ["D:\\workspace\\ai_workspace\\tomcat-ops-helper\\bin\\mcpstdio.exe"],
+      "enabled": true,
+      "environment": {
+        "MCP_HTTP_URL": "http://127.0.0.1:7777"
+      }
+    },
     "outline": {
       "type": "remote",
       "url": "http://221.226.123.130:3000/mcp",
