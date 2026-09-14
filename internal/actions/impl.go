@@ -485,3 +485,82 @@ func writeAtomic(tmp, dst string, payload []byte, mode os.FileMode) error {
 	}
 	return nil
 }
+
+// ValidateData is the JSON returned by the "validate_config" action.
+// It reports what helper *actually* loaded (paths, allowed_dirs, and
+// the current health of every registered database connector) so the
+// operator can confirm config.json edits took effect without scraping
+// helper.log.
+//
+// Passwords are never returned — DBConfig.User is enough to verify
+// the credential, and Status.LastError tells you why a connector is
+// down without leaking anything.
+type ValidateData struct {
+	Now         time.Time                  `json:"now"`
+	TomcatHome  string                     `json:"tomcat_home"`
+	TomcatExists bool                      `json:"tomcat_exists"`
+	JDKHome     string                     `json:"jdk_home"`
+	JDKExists   bool                       `json:"jdk_exists"`
+	LogDir      string                     `json:"log_dir"`
+	LogDirExists bool                      `json:"log_dir_exists"`
+	AllowedDirs []ValidateAllowedDir       `json:"allowed_dirs"`
+	Connectors  map[string]ValidateConnector `json:"connectors"`
+}
+
+// ValidateAllowedDir is one entry of allowed_dirs with an existence check.
+type ValidateAllowedDir struct {
+	Path   string `json:"path"`
+	Exists bool   `json:"exists"`
+}
+
+// ValidateConnector is the health snapshot of one DB connector.
+type ValidateConnector struct {
+	Configured bool   `json:"configured"`
+	Open       bool   `json:"open"`
+	Driver     string `json:"driver,omitempty"`
+	Host       string `json:"host,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Database   string `json:"database,omitempty"`
+	LatencyMs  int64  `json:"latency_ms,omitempty"`
+	LastError  string `json:"last_error,omitempty"`
+}
+
+func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) {
+	_, tomcatErr := os.Stat(r.cfg.TomcatHome)
+	_, jdkErr := os.Stat(r.cfg.JDKHome)
+	_, logErr := os.Stat(r.cfg.LogDir)
+
+	dirs := make([]ValidateAllowedDir, 0, len(r.cfg.AllowedDirs))
+	for _, d := range r.cfg.AllowedDirs {
+		_, err := os.Stat(d)
+		dirs = append(dirs, ValidateAllowedDir{Path: d, Exists: err == nil})
+	}
+
+	connectors := make(map[string]ValidateConnector, len(r.dbops))
+	for name, op := range r.dbops {
+		st := op.Status(ctx)
+		connectors[name] = ValidateConnector{
+			Configured: st.Configured,
+			Open:       st.Open,
+			Driver:     st.Driver,
+			Host:       st.Host,
+			Port:       st.Port,
+			Database:   st.Database,
+			LatencyMs:  st.LatencyMs,
+			LastError:  st.LastError,
+		}
+	}
+
+	data := ValidateData{
+		Now:          time.Now().UTC(),
+		TomcatHome:   r.cfg.TomcatHome,
+		TomcatExists: tomcatErr == nil,
+		JDKHome:      r.cfg.JDKHome,
+		JDKExists:    jdkErr == nil,
+		LogDir:       r.cfg.LogDir,
+		LogDirExists: logErr == nil,
+		AllowedDirs:  dirs,
+		Connectors:   connectors,
+	}
+	return mustMarshal(data), nil
+}

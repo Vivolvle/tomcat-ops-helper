@@ -105,6 +105,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.writeFile(params)
 	case "upload_file":
 		return r.uploadFile(params)
+	case "validate_config":
+		return r.validateConfig(ctx)
 	case "esb_db_operator", "erp_db_operator":
 		return r.dbOperator(ctx, name, params)
 	default:
@@ -127,6 +129,26 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 	if workDir == "" {
 		workDir = r.cfg.TomcatHome
 	}
+
+	// Optional shell override. By default we go through cmd /C on Windows
+	// (or sh -c on Unix), which is fine for simple pipelines. When the
+	// user passes paths with spaces, or wants PowerShell-specific syntax
+	// (cmdlets, -EncodedCommand, etc.), "shell": "powershell" wraps the
+	// command in `powershell -NoProfile -NonInteractive -Command` with a
+	// `Set-Location` prologue so the work_dir still applies.
+	if s, _ := p["shell"].(string); s != "" {
+		switch strings.ToLower(s) {
+		case "powershell", "pwsh":
+			cmdStr = powershellWrap(cmdStr, workDir)
+		case "cmd":
+			// explicit "cmd" = no-op; default already is cmd on Windows.
+		case "sh":
+			// no-op on Unix. On Windows this would fail; not silently rewritten.
+		default:
+			return nil, fmt.Errorf("exec: unknown shell %q (want powershell|pwsh|cmd|sh)", s)
+		}
+	}
+
 	out, err := r.executor.Exec(ctx, cmdStr, workDir)
 	data := mustMarshal(map[string]any{
 		"stdout":    out.Stdout,
@@ -139,6 +161,23 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 		return data, err
 	}
 	return data, nil
+}
+
+// powershellWrap emits a single PowerShell -Command string that changes to
+// workDir then runs cmdStr. Both go through Go's `strings.Replace` so any
+// embedded single-quote in cmdStr gets doubled (PowerShell's escape rule).
+//
+// We do NOT shell-quote workDir because the executor's IsAllowedWorkDir
+// already validated it's an absolute, allowed path — and PowerShell's
+// Set-Location accepts a path with spaces as long as it's the last token
+// of the unquoted argument. We still wrap the whole prefix in single
+// quotes as a defensive measure for the rare path containing a quote.
+func powershellWrap(cmdStr, workDir string) string {
+	// PowerShell -Command takes a single string. Outer single quotes,
+	// cmd body with ' → ''.
+	escaped := strings.ReplaceAll(cmdStr, "'", "''")
+	return "powershell -NoProfile -NonInteractive -Command \"Set-Location -LiteralPath '" +
+		workDir + "'; " + escaped + "\""
 }
 
 // dbOperator runs a SQL script against the connector registered for
