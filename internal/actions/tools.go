@@ -71,7 +71,7 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "exec",
-			Description: "Run a single shell command with blacklist and allowed_dirs enforcement, output capped at cfg.max_output_size. Use sparingly; prefer named actions.",
+			Description: "Run a single shell command with blacklist and allowed_dirs enforcement, output capped at cfg.max_output_size. Default shell is cmd.exe /C on Windows or sh -c on Unix. For paths with spaces, PowerShell cmdlets, or when cmd /C's tokenize keeps eating your quotes, pass \"shell\":\"powershell\" to wrap the command in powershell -NoProfile -NonInteractive -Command. Shell metacharacter redirect/pipes (2>&1, |, &) are NOT supported; for complex scripts write the script to a file under allowed_dirs via write_file and run it. Use sparingly; prefer named actions.",
 			InputSchema: execSchema,
 		},
 		{
@@ -83,6 +83,11 @@ func coreTools() []Tool {
 			Name:        "upload_file",
 			Description: "Append a chunk to an in-progress file upload. The caller sends many Commands with the same upload_id (offset 0, 64K, 128K, ...). The final chunk sets chunk_done=true. Path must be under allowed_dirs; overwrite=true is required to replace an existing file. Returns bytes_written per chunk and {path, bytes, sha256, verified} on the final chunk. Intended to be driven by server.exe's POST /upload, not directly by LLMs.",
 			InputSchema: uploadFileSchema,
+		},
+		{
+			Name:        "validate_config",
+			Description: "Return what helper actually loaded: tomcat_home / jdk_home / log_dir existence, every allowed_dirs entry with existence check, and a per-connector health snapshot (Open / Driver / Host / Port / Database / LatencyMs / LastError). Connectors that were never wired in (esb / erp blocks missing from config.json) are omitted. Passwords are never returned. Use after editing config.json and restarting helper to confirm changes took effect.",
+			InputSchema: emptyObjectSchema,
 		},
 	}
 }
@@ -143,7 +148,8 @@ var execSchema = json.RawMessage(`{
 	"type":"object",
 	"properties":{
 		"cmd":{"type":"string","description":"Shell command. Runs through cmd.exe /C on Windows or sh -c on Unix."},
-		"work_dir":{"type":"string","description":"Working directory; defaults to cfg.tomcat_home."}
+		"work_dir":{"type":"string","description":"Working directory; defaults to cfg.tomcat_home."},
+		"shell":{"type":"string","enum":["powershell","pwsh","cmd","sh"],"description":"Optional shell override. 'powershell' or 'pwsh' wraps the command in powershell -NoProfile -NonInteractive -Command with a Set-Location prologue so paths with spaces and PowerShell-specific syntax work without the cmd /C tokenize quirks. Default is cmd /C on Windows, sh -c on Unix."}
 	},
 	"required":["cmd"],
 	"additionalProperties":false

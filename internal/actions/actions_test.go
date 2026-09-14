@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"tomcat-ops-helper/internal/config"
+	"tomcat-ops-helper/internal/dbop"
 	"tomcat-ops-helper/internal/execshell"
 )
 
@@ -451,4 +452,224 @@ func sha256OfInline(s string) string {
 	h := newHash()
 	h.Write([]byte(s))
 	return hexOf(h)
+}
+
+// TestValidateConfig_NoConnectors covers the "esb/erp blocks absent from
+// config.json" case: connectors map is empty, tomcat_home / jdk_home /
+// log_dir each report their own existence, allowed_dirs entries each
+// get an existence flag. Passwords must never appear.
+func TestValidateConfig_NoConnectors(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.validateConfig(context.Background())
+	if err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+	var got ValidateData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.TomcatHome != cfg.TomcatHome {
+		t.Fatalf("TomcatHome = %q, want %q", got.TomcatHome, cfg.TomcatHome)
+	}
+	if !got.TomcatExists || !got.JDKExists || !got.LogDirExists {
+		t.Fatalf("existence flags wrong: tomcat=%v jdk=%v log=%v",
+			got.TomcatExists, got.JDKExists, got.LogDirExists)
+	}
+	if len(got.AllowedDirs) != len(cfg.AllowedDirs) {
+		t.Fatalf("AllowedDirs len = %d, want %d", len(got.AllowedDirs), len(cfg.AllowedDirs))
+	}
+	if got.Connectors == nil {
+		t.Fatal("Connectors map is nil; want empty (but present)")
+	}
+	if len(got.Connectors) != 0 {
+		t.Fatalf("Connectors should be empty when none wired, got %v", got.Connectors)
+	}
+	// No password field exists by construction — nothing to assert on the
+	// raw bytes here, but verify the JSON has no "password" key anywhere.
+	if strings.Contains(string(raw), "password") {
+		t.Fatalf("validate_config response leaked a password field: %s", raw)
+	}
+}
+
+// TestValidateConfig_MissingDirs covers the case where one of the
+// configured dirs is gone (typo'd in config.json after editing) — the
+// report must still come back, just with exists=false. This is the
+// failure mode the operator would otherwise have to discover by
+// tail-ing helper.log.
+func TestValidateConfig_MissingDirs(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.TomcatHome = filepath.Join(t.TempDir(), "does-not-exist")
+	cfg.JDKHome = filepath.Join(t.TempDir(), "also-missing")
+	cfg.LogDir = filepath.Join(t.TempDir(), "logs-missing")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.validateConfig(context.Background())
+	if err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+	var got ValidateData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.TomcatExists || got.JDKExists || got.LogDirExists {
+		t.Fatalf("existence flags should be false for missing dirs, got %+v", got)
+	}
+}
+
+// TestValidateConfig_WithConnectors ensures each registered connector
+// surfaces its Status snapshot, including the LastError string when
+// the FakeOp reports Open=false. This is the post-edit-of-config.json
+// verification path: operator restarts helper, calls validate_config,
+// and immediately sees whether the new password took.
+func TestValidateConfig_WithConnectors(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t)).
+		WithDB("esb_db_operator", &dbop.FakeOp{
+			Driver: "mysql", Host: "h", Database: "d",
+			Open: true,
+		}).
+		WithDB("erp_db_operator", &dbop.FakeOp{
+			Driver: "oracle", Host: "oh", Database: "ORCL",
+			Open: false, LastError: "ORA-01017: invalid username/password",
+		})
+	raw, err := reg.validateConfig(context.Background())
+	if err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+	var got ValidateData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Connectors) != 2 {
+		t.Fatalf("Connectors = %d, want 2", len(got.Connectors))
+	}
+	esb, ok := got.Connectors["esb_db_operator"]
+	if !ok {
+		t.Fatal("missing esb_db_operator in result")
+	}
+	if !esb.Open || esb.Driver != "mysql" || esb.Host != "h" || esb.Database != "d" {
+		t.Fatalf("esb snapshot wrong: %+v", esb)
+	}
+	erp, ok := got.Connectors["erp_db_operator"]
+	if !ok {
+		t.Fatal("missing erp_db_operator in result")
+	}
+	if erp.Open {
+		t.Fatal("erp Open should be false (FakeOp)")
+	}
+	if !strings.Contains(erp.LastError, "ORA-01017") {
+		t.Fatalf("erp LastError should carry the ORA-01017 message, got %q", erp.LastError)
+	}
+}
+
+// TestPowerShellWrap covers the helper that translates a plain
+// user command + work_dir into a single PowerShell -Command string.
+// The output is what gets handed to Executor.Exec; if quoting is
+// wrong, paths with spaces break (the original 2026-09-14 customer
+// box pain point where cmd /C ate the quoting on
+// "C:\Program Files\...").
+func TestPowerShellWrap(t *testing.T) {
+	cases := []struct {
+		name   string
+		cmd    string
+		work   string
+		must   []string // substrings that must appear
+		mustNot []string
+	}{
+		{
+			name: "plain",
+			cmd:  "Get-Process mysqld",
+			work: `D:\bs-esb`,
+			must: []string{
+				"powershell -NoProfile -NonInteractive -Command",
+				"Set-Location -LiteralPath 'D:\\bs-esb'",
+				"Get-Process mysqld",
+			},
+		},
+		{
+			name: "path with spaces stays untouched in workDir argument",
+			cmd:  "Get-ChildItem",
+			work: `D:\Program Files\MySQL`,
+			must: []string{
+				"Set-Location -LiteralPath 'D:\\Program Files\\MySQL'",
+			},
+			// The wrapped string should still be one self-contained
+			// "powershell … -Command …" line so cmd /C cannot tokenize
+			// the inner arguments away.
+			mustNot: []string{
+				// No bare CR/LF in the middle (would break cmd /C).
+				"\r\n",
+			},
+		},
+		{
+			name: "single quote in user cmd is doubled",
+			cmd:  `Write-Output 'hello'`,
+			work: `D:\bs-esb`,
+			must: []string{
+				`Write-Output ''hello'`,
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := powershellWrap(c.cmd, c.work)
+			for _, m := range c.must {
+				if !strings.Contains(got, m) {
+					t.Errorf("missing %q in: %s", m, got)
+				}
+			}
+			for _, m := range c.mustNot {
+				if strings.Contains(got, m) {
+					t.Errorf("forbidden substring %q present in: %s", m, got)
+				}
+			}
+		})
+	}
+}
+
+// TestExecAction_RejectsUnknownShell documents the validation: the
+// caller passes a typo'd shell name and we return a clear error
+// instead of silently using cmd /C.
+func TestExecAction_RejectsUnknownShell(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	_, err := reg.execAction(context.Background(), mustMarshal(map[string]any{
+		"cmd":   "echo hi",
+		"shell": "fish",
+	}))
+	if err == nil {
+		t.Fatal("expected error for unknown shell")
+	}
+	if !strings.Contains(err.Error(), "unknown shell") {
+		t.Fatalf("error message should mention 'unknown shell', got %v", err)
+	}
+}
+
+// TestTools_SchemasAreValidJSON catches a class of bugs we hit on
+// 2026-09-14: a description string in execSchema contained an
+// unescaped inner `"`, which made the whole ToolList body
+// non-JSON. Helper.PostConnect then failed to send it, the helper
+// looped reconnecting, and the customer box couldn't list tools.
+// Every inputSchema shipped to clients must round-trip through
+// json.Unmarshal — anything else is a bug.
+func TestTools_SchemasAreValidJSON(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t)).
+		WithDB("esb_db_operator", &dbop.FakeOp{Driver: "mysql"}).
+		WithDB("erp_db_operator", &dbop.FakeOp{Driver: "oracle"})
+	for _, t0 := range reg.Tools() {
+		t.Run(t0.Name, func(t *testing.T) {
+			var v any
+			if err := json.Unmarshal(t0.InputSchema, &v); err != nil {
+				t.Fatalf("inputSchema for %s is not valid JSON: %v\nschema: %s", t0.Name, err, string(t0.InputSchema))
+			}
+			// And it must be an object (MCP / tool-use convention).
+			if _, ok := v.(map[string]any); !ok {
+				t.Fatalf("inputSchema for %s must be a JSON object, got %T", t0.Name, v)
+			}
+		})
+	}
 }
