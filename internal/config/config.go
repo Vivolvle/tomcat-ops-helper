@@ -15,6 +15,7 @@ import (
 type HelperConfig struct {
 	ServerURL         string        `json:"server_url"`
 	Token             string        `json:"token"`
+	ClientID          string        `json:"client_id,omitempty"`
 	TomcatHome        string        `json:"tomcat_home"`
 	JDKHome           string        `json:"jdk_home"`
 	LogDir            string        `json:"log_dir"`
@@ -120,6 +121,7 @@ func (c *DBConfig) EffectivePort(driver string) int {
 type rawHelper struct {
 	ServerURL          string          `json:"server_url"`
 	Token              string          `json:"token"`
+	ClientID           string          `json:"client_id,omitempty"`
 	TomcatHome         string          `json:"tomcat_home"`
 	JDKHome            string          `json:"jdk_home"`
 	LogDir             string          `json:"log_dir"`
@@ -243,6 +245,7 @@ func parseHelper(raw []byte) (*HelperConfig, error) {
 	cfg := &HelperConfig{
 		ServerURL:          rh.ServerURL,
 		Token:              rh.Token,
+		ClientID:           rh.ClientID,
 		TomcatHome:         rh.TomcatHome,
 		JDKHome:            rh.JDKHome,
 		LogDir:             rh.LogDir,

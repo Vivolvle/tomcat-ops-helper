@@ -108,8 +108,12 @@ func main() {
 		ReconnectInterval:  cfg.ReconnectInterval,
 		Logger:             logger,
 		Hello: func() protocol.Hello {
+			clientID := cfg.ClientID
+			if clientID == "" {
+				clientID = "helper-" + hostname
+			}
 			return protocol.Hello{
-				ClientID: "helper-" + hostname,
+				ClientID: clientID,
 				Token:    cfg.Token,
 				Version:  helperVersion,
 				Hostname: hostname,
