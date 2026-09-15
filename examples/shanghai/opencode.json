@@ -1,0 +1,17 @@
+{
+  "$comment": "operator box · opencode agent for the 上海 project. Sibling workspaces (nantong, xin-project) reuse the same mcpstdio.exe but pin MCP_CLIENT_ID to their own helper.",
+
+  "mcp": {
+    "tomcat-helper": {
+      "type": "local",
+      "command": [
+        "D:\\workspace\\ai_workspace\\tomcat-ops-helper\\bin\\mcpstdio.exe"
+      ],
+      "enabled": true,
+      "environment": {
+        "MCP_HTTP_URL": "http://127.0.0.1:7777",
+        "MCP_CLIENT_ID": "shanghai"
+      }
+    }
+  }
+}

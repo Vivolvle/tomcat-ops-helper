@@ -7,7 +7,8 @@
       "command": ["D:\\workspace\\ai_workspace\\tomcat-ops-helper\\bin\\mcpstdio.exe"],
       "enabled": true,
       "environment": {
-        "MCP_HTTP_URL": "http://127.0.0.1:7777"
+        "MCP_HTTP_URL": "http://127.0.0.1:7777",
+        "MCP_CLIENT_ID": "benji"
       }
     },
     "outline": {
