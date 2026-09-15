@@ -107,7 +107,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client := s.newClient(conn)
-	defer s.removeClient(client.ID)
+	// NB: capture the *Client, not client.ID — adoptClientID may rename
+	// client.ID after the defer is registered. We must remove whatever id the
+	// client actually ended up under (the helper-supplied id), otherwise the
+	// old c-N entry is a harmless no-op but the real id leaks in s.clients
+	// and forever blocks future helpers from adopting the same id.
+	defer func() {
+		client.mu.Lock()
+		id := client.ID
+		client.mu.Unlock()
+		s.removeClient(id)
+	}()
 
 	s.mu.Lock()
 	cb := s.onResult

@@ -59,6 +59,46 @@ func TestServer_AcceptsClientAndExposes(t *testing.T) {
 	}
 }
 
+func TestServer_ReAdoptsSameClientIDAfterReconnect(t *testing.T) {
+	// Regression: previously, defer s.removeClient(client.ID) captured the
+	// temporary c-N id at defer-statement time. After adoptClientID renamed
+	// client.ID to the helper-supplied id, the deferred remove ran against
+	// the obsolete c-N (no-op) and leaked the real id in s.clients. The
+	// next helper that tried to adopt the same id was refused because it
+	// looked "taken", and got stuck on c-(N+1) forever.
+	srv := httptest.NewServer(New(func(tok string) bool { return tok == "good" }, nil))
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+
+	connect := func(clientID string) {
+		conn, _, err := websocket.DefaultDialer.Dial(url, http.Header{"Authorization": []string{"Bearer good"}})
+		if err != nil {
+			t.Fatalf("dial %s: %v", clientID, err)
+		}
+		env := (protocol.Hello{ClientID: clientID, Token: "good", Hostname: "h", Version: "v"}).ToEnvelope()
+		if err := conn.WriteJSON(env); err != nil {
+			t.Fatalf("write hello %s: %v", clientID, err)
+		}
+		// Read one message to give the server a chance to process the Hello
+		// before we close.
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _, _ = conn.ReadMessage()
+		conn.Close()
+		// Wait for the server's deferred removeClient to run.
+		time.Sleep(80 * time.Millisecond)
+	}
+
+	connect("benji")
+	connect("benji") // second helper, same id — must adopt cleanly
+
+	clients := srv.Config.Handler.(*Server).Clients()
+	for _, c := range clients {
+		if c.ID == "benji" {
+			t.Fatalf("stale benji entry leaked in s.clients: %+v", c)
+		}
+	}
+}
+
 func TestClient_SendAfterClose(t *testing.T) {
 	srv := httptest.NewServer(New(func(string) bool { return true }, nil))
 	defer srv.Close()
