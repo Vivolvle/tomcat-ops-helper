@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -26,6 +28,11 @@ type StatusData struct {
 	TomcatExists bool         `json:"tomcat_exists"`
 	JavaProcs   []JavaProcess `json:"java_processes"`
 	Ports       []Port        `json:"listening_ports"`
+	// ConfigLoadedAt is when helper last read config.json. Compare against
+	// the file's mtime on disk: a mismatch means config.json was edited
+	// after startup and a restart is required for changes to take effect
+	// (helper does not hot-reload config).
+	ConfigLoadedAt time.Time `json:"config_loaded_at"`
 }
 
 func (r *Registry) status(ctx context.Context) (json.RawMessage, error) {
@@ -46,13 +53,14 @@ func (r *Registry) status(ctx context.Context) (json.RawMessage, error) {
 	host, _ := os.Hostname()
 	_, statErr := os.Stat(r.cfg.TomcatHome)
 	data := StatusData{
-		Hostname:     host,
-		OS:           runtime.GOOS,
-		Now:          time.Now().UTC(),
-		TomcatHome:   r.cfg.TomcatHome,
-		TomcatExists: statErr == nil,
-		JavaProcs:    filtered,
-		Ports:        ports,
+		Hostname:       host,
+		OS:             runtime.GOOS,
+		Now:            time.Now().UTC(),
+		TomcatHome:     r.cfg.TomcatHome,
+		TomcatExists:   statErr == nil,
+		JavaProcs:      filtered,
+		Ports:          ports,
+		ConfigLoadedAt: r.cfg.LoadedAt.UTC(),
 	}
 	return mustMarshal(data), nil
 }
@@ -325,9 +333,54 @@ func killPID(ctx context.Context, pid int) error {
 
 // RegenServiceData is the JSON returned by "regen_service".
 type RegenServiceData struct {
-	Path    string `json:"path"`
-	Bytes   int    `json:"bytes"`
-	Content string `json:"content,omitempty"`
+	Path           string `json:"path"`
+	Bytes          int    `json:"bytes"`
+	ServiceName    string `json:"service_name,omitempty"`
+	PrunsrvPath    string `json:"prunsrv_path,omitempty"`     // path to <ServiceName>.exe (prunsrv)
+	PrunsrvCopied  bool   `json:"prunsrv_copied"`             // true if tomcat9/tomcat10.exe was copied to <ServiceName>.exe
+	PrunsrvExisted bool   `json:"prunsrv_already_existed"`    // true if <ServiceName>.exe was already on disk
+	PrunsrvSource  string `json:"prunsrv_source,omitempty"`   // where the prunsrv copy was sourced from, if anything
+	MonitorPath    string `json:"monitor_path,omitempty"`      // path to <ServiceName>w.exe
+	MonitorCopied  bool   `json:"monitor_copied"`              // true if tomcat9w/tomcat10w.exe was copied to <ServiceName>w.exe
+	MonitorExisted bool   `json:"monitor_already_existed"`     // true if <ServiceName>w.exe was already on disk
+	MonitorSource  string `json:"monitor_source,omitempty"`    // where the monitor copy was sourced from, if anything
+	Content        string `json:"content,omitempty"`
+}
+
+// resolveServiceName derives the Windows service name. cfg.ServiceName wins;
+// otherwise we look for the first <Connector port="N"/> in server.xml and
+// return "Tomcat<N>"; failing that we return "Tomcat".
+func resolveServiceName(tomcatHome, configured string) string {
+	if configured != "" {
+		return configured
+	}
+	confPath := filepath.Join(tomcatHome, "conf", "server.xml")
+	data, err := os.ReadFile(confPath)
+	if err != nil {
+		return "Tomcat"
+	}
+	// Coarse: find <Connector ... port="N" ...>. Not XML-aware; accepts
+	// double or single quotes and runs of attributes. Good enough for the
+	// canonical server.xml Tomcat ships.
+	re := regexp.MustCompile(`(?i)<Connector[^>]*\bport\s*=\s*["'](\d+)["']`)
+	m := re.FindSubmatch(data)
+	if m == nil {
+		return "Tomcat"
+	}
+	return "Tomcat" + string(m[1])
+}
+
+// resolvePrunsrvSource tries Tomcat 10 then 9. Returns the prunsrv path
+// and its monitor sibling (tomcatXw.exe) so regen_service can copy both.
+// Empty strings mean "neither is on disk" — the caller falls back to
+// logging that fact to the caller instead of pretending to copy.
+func resolvePrunsrvSource(bin string) (prunsrv, monitor string) {
+	for _, base := range []string{"tomcat10", "tomcat9"} {
+		if _, err := os.Stat(filepath.Join(bin, base+".exe")); err == nil {
+			return filepath.Join(bin, base + ".exe"), filepath.Join(bin, base + "w.exe")
+		}
+	}
+	return "", ""
 }
 
 func (r *Registry) regenService(params json.RawMessage) (json.RawMessage, error) {
@@ -335,10 +388,50 @@ func (r *Registry) regenService(params json.RawMessage) (json.RawMessage, error)
 	if !r.cfg.IsAllowedWorkDir(bin) {
 		return nil, errors.New("regen_service: bin dir not allowed")
 	}
-	var path, content string
+	var (
+		path, content string
+		serviceName   string
+		prunsrvPath   string
+		prunsrvCopied bool
+		prunsrvExisted bool
+		prunsrvSrc    string
+		monitorPath   string
+		monitorCopied bool
+		monitorExisted bool
+		monitorSrc    string
+	)
 	if runtime.GOOS == "windows" {
+		serviceName = resolveServiceName(r.cfg.TomcatHome, r.cfg.ServiceName)
 		path = filepath.Join(bin, "service.bat")
-		content = buildWindowsService(r.cfg)
+		content = buildWindowsService(r.cfg, serviceName)
+		// Service install on Windows needs two renamed binaries in
+		// <bin>: <ServiceName>.exe (prunsrv, used by "service.bat
+		// install" //IS//<name>) and <ServiceName>w.exe (the GUI
+		// monitor). Tomcat ships them as tomcat9/10 + the w suffix; the
+		// operator used to rename them by hand. Helper writes the
+		// copies when missing so "service.bat install" works without
+		// going through the README dance.
+		psrc, msrc := resolvePrunsrvSource(bin)
+		prunsrvDst := filepath.Join(bin, serviceName+".exe")
+		monitorDst := filepath.Join(bin, serviceName+"w.exe")
+		prunsrvPath = prunsrvDst
+		monitorPath = monitorDst
+		prunsrvSrc = psrc
+		monitorSrc = msrc
+		if _, err := os.Stat(prunsrvDst); err == nil {
+			prunsrvExisted = true
+		} else if psrc != "" {
+			if _, copyErr := copyFileForRegen(psrc, prunsrvDst); copyErr == nil {
+				prunsrvCopied = true
+			}
+		}
+		if _, err := os.Stat(monitorDst); err == nil {
+			monitorExisted = true
+		} else if msrc != "" {
+			if _, copyErr := copyFileForRegen(msrc, monitorDst); copyErr == nil {
+				monitorCopied = true
+			}
+		}
 	} else {
 		path = filepath.Join(bin, "service.sh")
 		content = buildUnixService(r.cfg)
@@ -346,7 +439,37 @@ func (r *Registry) regenService(params json.RawMessage) (json.RawMessage, error)
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		return nil, fmt.Errorf("regen_service: write: %w", err)
 	}
-	return mustMarshal(RegenServiceData{Path: path, Bytes: len(content)}), nil
+	return mustMarshal(RegenServiceData{
+		Path:           path,
+		Bytes:          len(content),
+		ServiceName:    serviceName,
+		PrunsrvPath:    prunsrvPath,
+		PrunsrvCopied:  prunsrvCopied,
+		PrunsrvExisted: prunsrvExisted,
+		PrunsrvSource:  prunsrvSrc,
+		MonitorPath:    monitorPath,
+		MonitorCopied:  monitorCopied,
+		MonitorExisted: monitorExisted,
+		MonitorSource:  monitorSrc,
+	}), nil
+}
+
+// copyFileForRegen is a plain byte copy used by regen_service to materialise
+// the prunsrv / monitor copies. Private because regen_service is the only
+// caller — the replace_jar path needs fsync + atomic-rename semantics
+// (see copyFile in probe.go).
+func copyFileForRegen(src, dst string) (int64, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	defer out.Close()
+	return io.Copy(out, in)
 }
 
 func buildUnixService(c *config.HelperConfig) string {
@@ -358,7 +481,7 @@ case "$1" in
   start)   %q start   ;;
   stop)    %q stop    ;;
   restart) %q stop; %q start ;;
-  *) echo "usage: $0 {{start|stop|restart}}"; exit 1 ;;
+  *) echo "usage: $0 {start|stop|restart}"; exit 1 ;;
 esac
 `,
 		c.JDKHome,
@@ -370,20 +493,94 @@ esac
 	)
 }
 
-func buildWindowsService(c *config.HelperConfig) string {
+// buildWindowsService writes a thin service.bat that maps
+// "service.bat {start|stop|restart|install|remove}" onto the right
+// prunsrv.exe call. For start/stop/restart we prefer the Windows
+// service when it exists ("net start <name>"), and fall back to
+// calling startup.bat / shutdown.bat directly otherwise — so a fresh
+// Tomcat install that has never been turned into a service still
+// behaves the way startup.bat does out of the box. JAVA_HOME and
+// CATALINA_HOME are exported for every subcommand because prunsrv
+// (used by install/remove) spawns the JVM via the service-control
+// pipeline and needs both vars set before service creation; without
+// them service.bat install fails with the misleading "CATALINA_HOME
+// environment variable is not defined" message.
+func buildWindowsService(c *config.HelperConfig, serviceName string) string {
+	bin := filepath.Join(c.TomcatHome, "bin")
+	startup := filepath.Join(bin, "startup.bat")
+	shutdown := filepath.Join(bin, "shutdown.bat")
+	prunsrv := filepath.Join(bin, serviceName+".exe")
 	return fmt.Sprintf(`@echo off
-rem Auto-generated by tomcat-ops-helper
-set JAVA_HOME=%s
-set CATALINA_HOME=%s
-if "%%1"=="start" call "%s"
-if "%%1"=="stop" call "%s"
-if "%%1"=="restart" call "%s" && call "%s"
+rem Auto-generated by tomcat-ops-helper (service name: %s)
+setlocal
+set "JAVA_HOME=%s"
+set "CATALINA_HOME=%s"
+if /I "%%1"=="install" (
+  if not exist "%s" (
+    echo service.bat: %%1 needs tomcat9.exe/tomcat10.exe renamed first. Copy %%~dp0tomcat10.exe to %%~dp0%s.exe (Tomcat 10+) or tomcat9.exe to %%~dp0%s.exe (Tomcat 9). Run regen_service from the helper once Tomcat is installed under %%CATALINA_HOME%%\bin.
+    exit /b 1
+  )
+  call "%s" //IS//%s --DisplayName="Apache Tomcat" ^
+    --Install="%s" ^
+    --JavaHome="%s" ^
+    --CatalinaHome="%s" ^
+    --Jvm="%s\jre\bin\server\jvm.dll" ^
+    --StartMode=jvm --StopMode=jvm ^
+    --StartClass=org.apache.catalina.startup.Bootstrap --StartParams=start ^
+    --StopClass=org.apache.catalina.startup.Bootstrap --StopParams=stop ^
+    --LogPath="%s"
+  exit /b %%ERRORLEVEL%%
+)
+if /I "%%1"=="remove" (
+  call "%s" //DS//%s
+  exit /b %%ERRORLEVEL%%
+)
+if /I "%%1"=="start" (
+  sc query %s >nul 2>&1
+  if %%ERRORLEVEL%%==0 (
+    net start %s
+  ) else (
+    call "%s"
+  )
+  exit /b %%ERRORLEVEL%%
+)
+if /I "%%1"=="stop" (
+  sc query %s >nul 2>&1
+  if %%ERRORLEVEL%%==0 (
+    net stop %s
+  ) else (
+    call "%s"
+  )
+  exit /b %%ERRORLEVEL%%
+)
+if /I "%%1"=="restart" (
+  sc query %s >nul 2>&1
+  if %%ERRORLEVEL%%==0 (
+    net stop %s
+    net start %s
+  ) else (
+    call "%s"
+    call "%s"
+  )
+  exit /b %%ERRORLEVEL%%
+)
+echo usage: %%~nx0 {install^|remove^|start^|stop^|restart}
+exit /b 1
 `,
+		serviceName,
 		c.JDKHome, c.TomcatHome,
-		filepath.Join(c.TomcatHome, "bin", "startup.bat"),
-		filepath.Join(c.TomcatHome, "bin", "shutdown.bat"),
-		filepath.Join(c.TomcatHome, "bin", "shutdown.bat"),
-		filepath.Join(c.TomcatHome, "bin", "startup.bat"),
+		prunsrv,
+		serviceName, serviceName,
+		prunsrv, serviceName,
+		prunsrv,
+		c.JDKHome,
+		c.TomcatHome,
+		c.JDKHome,
+		filepath.Join(c.LogDir),
+		prunsrv, serviceName,
+		serviceName, serviceName, startup,
+		serviceName, serviceName, shutdown,
+		serviceName, serviceName, serviceName, shutdown, startup,
 	)
 }
 
@@ -496,15 +693,16 @@ func writeAtomic(tmp, dst string, payload []byte, mode os.FileMode) error {
 // the credential, and Status.LastError tells you why a connector is
 // down without leaking anything.
 type ValidateData struct {
-	Now         time.Time                  `json:"now"`
-	TomcatHome  string                     `json:"tomcat_home"`
-	TomcatExists bool                      `json:"tomcat_exists"`
-	JDKHome     string                     `json:"jdk_home"`
-	JDKExists   bool                       `json:"jdk_exists"`
-	LogDir      string                     `json:"log_dir"`
-	LogDirExists bool                      `json:"log_dir_exists"`
-	AllowedDirs []ValidateAllowedDir       `json:"allowed_dirs"`
-	Connectors  map[string]ValidateConnector `json:"connectors"`
+	Now           time.Time                  `json:"now"`
+	ConfigLoadedAt time.Time                 `json:"config_loaded_at"`
+	TomcatHome    string                     `json:"tomcat_home"`
+	TomcatExists  bool                       `json:"tomcat_exists"`
+	JDKHome       string                     `json:"jdk_home"`
+	JDKExists     bool                       `json:"jdk_exists"`
+	LogDir        string                     `json:"log_dir"`
+	LogDirExists  bool                       `json:"log_dir_exists"`
+	AllowedDirs   []ValidateAllowedDir       `json:"allowed_dirs"`
+	Connectors    map[string]ValidateConnector `json:"connectors"`
 }
 
 // ValidateAllowedDir is one entry of allowed_dirs with an existence check.
@@ -552,15 +750,16 @@ func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) 
 	}
 
 	data := ValidateData{
-		Now:          time.Now().UTC(),
-		TomcatHome:   r.cfg.TomcatHome,
-		TomcatExists: tomcatErr == nil,
-		JDKHome:      r.cfg.JDKHome,
-		JDKExists:    jdkErr == nil,
-		LogDir:       r.cfg.LogDir,
-		LogDirExists: logErr == nil,
-		AllowedDirs:  dirs,
-		Connectors:   connectors,
+		Now:            time.Now().UTC(),
+		ConfigLoadedAt: r.cfg.LoadedAt.UTC(),
+		TomcatHome:     r.cfg.TomcatHome,
+		TomcatExists:   tomcatErr == nil,
+		JDKHome:        r.cfg.JDKHome,
+		JDKExists:      jdkErr == nil,
+		LogDir:         r.cfg.LogDir,
+		LogDirExists:   logErr == nil,
+		AllowedDirs:    dirs,
+		Connectors:     connectors,
 	}
 	return mustMarshal(data), nil
 }

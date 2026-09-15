@@ -396,9 +396,25 @@ ghost bugs.
 
 1. **Local build + test** — `go test -count=1 -timeout 60s ./...`
    then `go build -ldflags="-s -w" -o bin\helper.exe .\cmd\helper`.
-2. **Copy to operator box staging dir** — `D:\tools\helper-client\helper.exe`
-   (the path the operator uses to hand off to the customer). Verify
-   sha256: `Get-FileHash 'D:\tools\helper-client\helper.exe'`.
+2. **Sync operator staging dir (REQUIRED)** — copy the freshly built
+   `bin\helper.exe` over `D:\tools\helper-client\helper.exe` so the
+   staging folder always tracks the latest binary. This is the
+   directory the operator hands off to the customer box, so it MUST
+   be the newest helper.exe — not whatever happened to be in there
+   from a previous build. Use the same `Copy-Item` (or your equivalent)
+   that step 3 uses, then verify both files match:
+
+   ```powershell
+   Copy-Item -Force .\bin\helper.exe D:\tools\helper-client\helper.exe
+   $a = (Get-FileHash .\bin\helper.exe).Hash
+   $b = (Get-FileHash 'D:\tools\helper-client\helper.exe').Hash
+   if ($a -ne $b) { throw "staging helper.exe sha256 mismatch: $a vs $b" }
+   ```
+
+   Do not skip this even if "the customer copy looks fine" — the
+   staging dir is the only artifact other agents see when handing
+   out helpers, and a stale copy there has caused real "wrong binary
+   on the customer box" bugs.
 3. **Hand off to customer box** — copy to `D:\bs-esb\helper-client\helper.exe`
    on the helper host. Same sha256 expected.
 4. **Restart helper** — kill the running `helper.exe` (taskkill /F
@@ -451,3 +467,9 @@ file-watch / hot-reload; a restart is the only way.
   variable names. PowerShell single-quoted strings are literal —
   `'D:\bs-esb'` is 8 chars; `'D:\\bs-esb'` is 9 chars. The difference
   matters when matching against file content.
+- After every helper rebuild: copy `bin\helper.exe` to
+  `D:\tools\helper-client\helper.exe` BEFORE shipping to the customer.
+  That staging dir is what other agents see and copy from, so leaving
+  it stale turns into "I copied the new build but the customer still
+  got the old one" bugs that take hours to chase. Full procedure in
+  "Deploying a new helper.exe" above.

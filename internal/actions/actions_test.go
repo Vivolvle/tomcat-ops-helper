@@ -62,6 +62,7 @@ func mustCfg(t *testing.T) *config.HelperConfig {
 
 func TestStatus_FiltersTomcatProcs(t *testing.T) {
 	cfg := mustCfg(t)
+	cfg.LoadedAt = time.Now().Add(-2 * time.Minute) // pretend helper loaded 2 min ago
 	exec := mustExec(t)
 	probe := &fakeProbe{
 		procs: []JavaProcess{
@@ -87,6 +88,15 @@ func TestStatus_FiltersTomcatProcs(t *testing.T) {
 	}
 	if got.OS == "" {
 		t.Fatal("OS should be set")
+	}
+	// ConfigLoadedAt round-trips so the operator can compare it against
+	// config.json's mtime on disk to detect a "edited but not restarted"
+	// scenario (problem.md feedback ⑤).
+	if got.ConfigLoadedAt.IsZero() {
+		t.Fatal("ConfigLoadedAt should not be zero")
+	}
+	if d := time.Since(got.ConfigLoadedAt); d < time.Minute || d > 3*time.Minute {
+		t.Fatalf("ConfigLoadedAt not preserved (delta=%s, want ~2m)", d)
 	}
 }
 
@@ -295,6 +305,203 @@ func TestRegenService_WritesFile(t *testing.T) {
 	}
 	if _, err := os.Stat(got.Path); err != nil {
 		t.Fatalf("expected file at %s: %v", got.Path, err)
+	}
+}
+
+func TestResolveServiceName_ConfiguredWins(t *testing.T) {
+	if got := resolveServiceName("irrelevant", "MyService"); got != "MyService" {
+		t.Fatalf("configured override ignored: %q", got)
+	}
+}
+
+func TestResolveServiceName_FallsBackToConnectorPort(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "conf")
+	if err := os.MkdirAll(conf, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	xml := `<?xml version="1.0"?>
+<Server port="8005" shutdown="SHUTDOWN">
+  <Service name="Catalina">
+    <Connector port="8080" protocol="HTTP/1.1"/>
+    <Connector port="8443" protocol="org.apache.coyote.http11.Http11NioProtocol"/>
+  </Service>
+</Server>
+`
+	if err := os.WriteFile(filepath.Join(conf, "server.xml"), []byte(xml), 0o644); err != nil {
+		t.Fatalf("write server.xml: %v", err)
+	}
+	if got := resolveServiceName(dir, ""); got != "Tomcat8080" {
+		t.Fatalf("expected Tomcat8080, got %q", got)
+	}
+}
+
+func TestResolveServiceName_FallsBackToPlainTomcat(t *testing.T) {
+	dir := t.TempDir() // no conf/server.xml
+	if got := resolveServiceName(dir, ""); got != "Tomcat" {
+		t.Fatalf("expected Tomcat fallback, got %q", got)
+	}
+}
+
+func TestResolvePrunsrvSource_PrefersTomcat10(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"tomcat10.exe", "tomcat10w.exe", "tomcat9.exe", "tomcat9w.exe"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	prunsrv, monitor := resolvePrunsrvSource(dir)
+	if !strings.HasSuffix(prunsrv, "tomcat10.exe") {
+		t.Fatalf("expected tomcat10.exe, got %s", prunsrv)
+	}
+	if !strings.HasSuffix(monitor, "tomcat10w.exe") {
+		t.Fatalf("expected tomcat10w.exe, got %s", monitor)
+	}
+}
+
+func TestResolvePrunsrvSource_Neither(t *testing.T) {
+	dir := t.TempDir()
+	prunsrv, monitor := resolvePrunsrvSource(dir)
+	if prunsrv != "" || monitor != "" {
+		t.Fatalf("expected empty, got prunsrv=%q monitor=%q", prunsrv, monitor)
+	}
+}
+
+func TestRegenService_CopiesPrunsrvAndMonitor(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only behaviour")
+	}
+	cfg := mustCfg(t)
+	bin := filepath.Join(cfg.TomcatHome, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Plant tomcat10.exe / tomcat10w.exe and a server.xml with port 9090
+	// so resolveServiceName picks up "Tomcat9090".
+	conf := filepath.Join(cfg.TomcatHome, "conf")
+	if err := os.MkdirAll(conf, 0o755); err != nil {
+		t.Fatalf("mkdir conf: %v", err)
+	}
+	xml := `<?xml version="1.0"?>
+<Server port="8005" shutdown="SHUTDOWN"><Service name="Catalina"><Connector port="9090"/></Service></Server>
+`
+	if err := os.WriteFile(filepath.Join(conf, "server.xml"), []byte(xml), 0o644); err != nil {
+		t.Fatalf("write server.xml: %v", err)
+	}
+	srcPrunsrv := []byte("prunsrv-bytes")
+	srcMonitor := []byte("monitor-bytes")
+	if err := os.WriteFile(filepath.Join(bin, "tomcat10.exe"), srcPrunsrv, 0o644); err != nil {
+		t.Fatalf("write prunsrv src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "tomcat10w.exe"), srcMonitor, 0o644); err != nil {
+		t.Fatalf("write monitor src: %v", err)
+	}
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.regenService(nil)
+	if err != nil {
+		t.Fatalf("regenService: %v", err)
+	}
+	var got RegenServiceData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ServiceName != "Tomcat9090" {
+		t.Fatalf("service name = %q, want Tomcat9090", got.ServiceName)
+	}
+	if !got.PrunsrvCopied || !got.MonitorCopied {
+		t.Fatalf("expected both copies, got prunsrv=%v monitor=%v", got.PrunsrvCopied, got.MonitorCopied)
+	}
+	for _, p := range []string{got.PrunsrvPath, got.MonitorPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("expected file at %s: %v", p, err)
+		}
+	}
+	// Second call should report already-existed without overwriting.
+	raw, err = reg.regenService(nil)
+	if err != nil {
+		t.Fatalf("regenService second call: %v", err)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal 2: %v", err)
+	}
+	if !got.PrunsrvExisted || !got.MonitorExisted {
+		t.Fatalf("expected already-existed on second call, got prunsrv=%v monitor=%v", got.PrunsrvExisted, got.MonitorExisted)
+	}
+	if got.PrunsrvCopied || got.MonitorCopied {
+		t.Fatalf("did not expect copies on second call")
+	}
+}
+
+func TestRegenService_NoPrunsrvSkipsCopies(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only behaviour")
+	}
+	cfg := mustCfg(t)
+	bin := filepath.Join(cfg.TomcatHome, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.regenService(nil)
+	if err != nil {
+		t.Fatalf("regenService: %v", err)
+	}
+	var got RegenServiceData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.PrunsrvCopied || got.MonitorCopied || got.PrunsrvExisted || got.MonitorExisted {
+		t.Fatalf("expected no copy activity, got %+v", got)
+	}
+	if got.PrunsrvSource != "" || got.MonitorSource != "" {
+		t.Fatalf("expected empty source paths, got prunsrv=%q monitor=%q", got.PrunsrvSource, got.MonitorSource)
+	}
+}
+
+func TestBuildWindowsService_ContainsRequiredAnchors(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.LogDir = filepath.Join(cfg.TomcatHome, "logs")
+	cfg.ServiceName = "Tomcat8080"
+	out := buildWindowsService(cfg, "Tomcat8080")
+	anchors := []string{
+		`set "JAVA_HOME=`,
+		`set "CATALINA_HOME=`,
+		`if /I "%1"=="start"`,
+		`if /I "%1"=="stop"`,
+		`if /I "%1"=="restart"`,
+		`if /I "%1"=="install"`,
+		`if /I "%1"=="remove"`,
+		`net start Tomcat8080`,
+		`net stop Tomcat8080`,
+		`--Install="`,
+		`--JavaHome="`,
+		`--CatalinaHome="`,
+		`sc query Tomcat8080`,
+	}
+	for _, a := range anchors {
+		if !strings.Contains(out, a) {
+			t.Errorf("missing anchor %q in service.bat output:\n%s", a, out)
+		}
+	}
+	// Must NOT escape the brace characters in the usage line any more —
+	// the previous version rendered `usage: service.bat {install^|remove^|...`
+	// which is correct; the previous-sh version had `{{start|stop|restart}}`
+	// which was the Go-template placeholder bug. The Windows side never
+	// had that bug, but pin it explicitly so a future refactor doesn't
+	// reintroduce template placeholders.
+	if strings.Contains(out, "{{") || strings.Contains(out, "}}") {
+		t.Fatalf("service.bat output contains Go template placeholder fragments:\n%s", out)
+	}
+}
+
+func TestBuildUnixService_NoTemplatePlaceholders(t *testing.T) {
+	cfg := mustCfg(t)
+	out := buildUnixService(cfg)
+	if strings.Contains(out, "{{") || strings.Contains(out, "}}") {
+		t.Fatalf("service.sh output still contains {{...}} Go template placeholders:\n%s", out)
+	}
+	if !strings.Contains(out, "usage: $0 {start|stop|restart}") {
+		t.Fatalf("expected clean usage line in service.sh, got:\n%s", out)
 	}
 }
 
@@ -565,6 +772,31 @@ func TestValidateConfig_WithConnectors(t *testing.T) {
 	}
 	if !strings.Contains(erp.LastError, "ORA-01017") {
 		t.Fatalf("erp LastError should carry the ORA-01017 message, got %q", erp.LastError)
+	}
+}
+
+// TestValidateConfig_ReportsConfigLoadedAt covers the "is my helper running
+// the new config.json?" question. The operator compares this timestamp
+// against config.json's mtime on disk; a stale value means helper has not
+// been restarted since the last edit (problem.md feedback ⑤).
+func TestValidateConfig_ReportsConfigLoadedAt(t *testing.T) {
+	cfg := mustCfg(t)
+	when := time.Now().Add(-3 * time.Minute)
+	cfg.LoadedAt = when
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.validateConfig(context.Background())
+	if err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+	var got ValidateData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ConfigLoadedAt.IsZero() {
+		t.Fatal("ConfigLoadedAt missing from validateConfig response")
+	}
+	if d := time.Since(got.ConfigLoadedAt); d < 2*time.Minute || d > 4*time.Minute {
+		t.Fatalf("ConfigLoadedAt not preserved (delta=%s, want ~3m)", d)
 	}
 }
 

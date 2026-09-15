@@ -203,6 +203,52 @@ func TestLoadHelper_DBConfig_NotConfiguredIsFine(t *testing.T) {
 	}
 }
 
+// TestLoadHelper_SetsLoadedAt covers the "did helper pick up my edit?"
+// check exposed via status.config_loaded_at and validate_config.
+// Without this stamp, an LLM can only guess why a config change didn't
+// take effect.
+func TestLoadHelper_SetsLoadedAt(t *testing.T) {
+	before := time.Now()
+	cfg, err := LoadHelper(writeTempConfig(t, validJSON()))
+	if err != nil {
+		t.Fatalf("LoadHelper: %v", err)
+	}
+	if cfg.LoadedAt.Before(before) {
+		t.Fatalf("LoadedAt (%s) is before test start (%s)", cfg.LoadedAt, before)
+	}
+	if d := time.Since(cfg.LoadedAt); d > 5*time.Second {
+		t.Fatalf("LoadedAt not close to now: %s", d)
+	}
+}
+
+// TestHelperConfig_ServiceNameOptional confirms service_name is purely an
+// override (empty is fine; regen_service derives the name from server.xml).
+func TestHelperConfig_ServiceNameOptional(t *testing.T) {
+	cfg, err := LoadHelper(writeTempConfig(t, validJSON()))
+	if err != nil {
+		t.Fatalf("LoadHelper: %v", err)
+	}
+	if cfg.ServiceName != "" {
+		t.Fatalf("expected empty default service_name, got %q", cfg.ServiceName)
+	}
+}
+
+func TestLoadHelper_ServiceNameOverride(t *testing.T) {
+	body := `{
+		"server_url":"wss://x","token":"longenough",
+		"tomcat_home":"C:\\t","jdk_home":"C:\\j","log_dir":"C:\\t\\l",
+		"allowed_dirs":["C:\\t"],
+		"service_name":"MyTomcat"
+	}`
+	cfg, err := LoadHelper(writeTempConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadHelper: %v", err)
+	}
+	if cfg.ServiceName != "MyTomcat" {
+		t.Fatalf("ServiceName = %q, want MyTomcat", cfg.ServiceName)
+	}
+}
+
 func TestHelperConfig_IsAllowedWorkDir(t *testing.T) {
 	dir := t.TempDir()
 	inner := filepath.Join(dir, "inner")

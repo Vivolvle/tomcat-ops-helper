@@ -28,6 +28,20 @@ type HelperConfig struct {
 	LogFile           string        `json:"log_file"`
 	InsecureSkipVerify bool         `json:"insecure_skip_verify"`
 
+	// LoadedAt is when this HelperConfig was parsed from disk. Set by
+	// LoadHelper. Exposed (json:"-") so status / validate_config can
+	// tell the operator which config snapshot helper is currently
+	// running — useful when config.json was edited but helper not
+	// restarted.
+	LoadedAt time.Time `json:"-"`
+
+	// ServiceName is the Windows service name registered for this
+	// Tomcat (regen_service writes service.bat; tomcat10w.exe must be
+	// renamed to <ServiceName>w.exe for the GUI monitor to bind).
+	// Empty means "derive from server.xml <Connector port="N"/> (first
+	// hit) and fall back to "Tomcat" if nothing is found."
+	ServiceName string `json:"service_name,omitempty"`
+
 	// ESB connector (always MySQL 8). Optional; nil means the esb_db_operator
 	// tool is not advertised.
 	ESB *DBConfig `json:"esb,omitempty"`
@@ -133,6 +147,7 @@ type rawHelper struct {
 	HeartbeatTimeout   json.RawMessage `json:"heartbeat_timeout"`
 	LogFile            string          `json:"log_file"`
 	InsecureSkipVerify bool            `json:"insecure_skip_verify"`
+	ServiceName        string          `json:"service_name,omitempty"`
 	ESB                *DBConfig       `json:"esb,omitempty"`
 	ERP                *DBConfig       `json:"erp,omitempty"`
 }
@@ -228,6 +243,7 @@ func LoadHelper(path string) (*HelperConfig, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	cfg.LoadedAt = time.Now()
 	return cfg, nil
 }
 
@@ -256,6 +272,7 @@ func parseHelper(raw []byte) (*HelperConfig, error) {
 		AllowedDirs:        rh.AllowedDirs,
 		LogFile:            rh.LogFile,
 		InsecureSkipVerify: rh.InsecureSkipVerify,
+		ServiceName:        rh.ServiceName,
 		ESB:                rh.ESB,
 		ERP:                rh.ERP,
 	}
