@@ -5,5 +5,6 @@
   "tls_key": "C:\\certs\\ops.key",
   "tokens": ["REPLACE_WITH_LONG_RANDOM_STRING"],
   "audit_log": "audit.log",
-  "agent_listen": "127.0.0.1:7777"
+  "agent_listen": "127.0.0.1:7777",
+  "problem_log": "problem.md"
 }

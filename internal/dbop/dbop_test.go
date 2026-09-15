@@ -3,9 +3,12 @@ package dbop
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -463,6 +466,110 @@ func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
 				t.Fatalf("DSN %q still has empty-user ':@' prefix — the original bug", capturedDSN)
 			}
 		})
+	}
+}
+
+// ---- Lazy reconnect (2026-09-15 G4①) ----
+
+var registerFakeDBDriverOnce sync.Once
+
+// dbopFakeDriver is a minimal database/sql driver that answers Ping and
+// returns empty result sets, so tests can exercise SQLOp's open / ping /
+// query plumbing without a real database.
+type dbopFakeDriver struct{}
+
+func (dbopFakeDriver) Open(string) (driver.Conn, error) { return dbopFakeConn{}, nil }
+
+type dbopFakeConn struct{}
+
+func (dbopFakeConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("dbop-fake: prepare unsupported")
+}
+func (dbopFakeConn) Close() error               { return nil }
+func (dbopFakeConn) Begin() (driver.Tx, error)  { return nil, errors.New("dbop-fake: tx unsupported") }
+func (dbopFakeConn) Ping(context.Context) error { return nil }
+
+func (dbopFakeConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	return dbopFakeRows{}, nil
+}
+
+func (dbopFakeConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	return driver.RowsAffected(0), nil
+}
+
+type dbopFakeRows struct{}
+
+func (dbopFakeRows) Columns() []string         { return []string{"c1"} }
+func (dbopFakeRows) Close() error              { return nil }
+func (dbopFakeRows) Next([]driver.Value) error { return io.EOF }
+
+func newLazyTestOp(open func(driverName, dsn string) (*sql.DB, error)) *SQLOp {
+	cfg := &config.DBConfig{Host: "h", Port: 3306, User: "u", Password: "p", Database: "d"}
+	return &SQLOp{
+		driver:   cfg.Driver(),
+		host:     cfg.Host,
+		port:     cfg.EffectivePort(cfg.Driver()),
+		user:     cfg.User,
+		password: cfg.Password,
+		database: cfg.Database,
+		status: Status{
+			Configured: true,
+			Driver:     cfg.Driver(),
+			Host:       cfg.Host,
+			Port:       cfg.EffectivePort(cfg.Driver()),
+			Database:   cfg.Database,
+		},
+		open:   open,
+		pingTO: 2 * time.Second,
+	}
+}
+
+// TestSQLOp_LazyReopenAfterStartupFailure is the G4① regression: a
+// connector whose startup ping failed must recover once the DB comes up,
+// without a helper restart. Pre-fix, Query/Exec returned the cached
+// "connector not open" error forever.
+func TestSQLOp_LazyReopenAfterStartupFailure(t *testing.T) {
+	registerFakeDBDriverOnce.Do(func() { sql.Register("dbop-fake", dbopFakeDriver{}) })
+
+	op := newLazyTestOp(func(string, string) (*sql.DB, error) {
+		return nil, errors.New("dial tcp: connect: connection refused")
+	})
+	if _, err := op.Query(context.Background(), "SELECT 1", 10); err == nil ||
+		!strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("expected lazy-open failure to surface, got %v", err)
+	}
+	if st := op.Status(context.Background()); !strings.Contains(st.LastError, "connection refused") {
+		t.Fatalf("status should carry the failure, got %+v", st)
+	}
+
+	// "MySQL gets installed": the next call must reconnect on its own.
+	op.mu.Lock()
+	op.open = func(_, dsn string) (*sql.DB, error) { return sql.Open("dbop-fake", dsn) }
+	op.mu.Unlock()
+
+	qr, err := op.Query(context.Background(), "SELECT 1", 10)
+	if err != nil {
+		t.Fatalf("lazy reopen failed: %v", err)
+	}
+	if qr.RowCount != 0 {
+		t.Fatalf("RowCount = %d, want 0", qr.RowCount)
+	}
+	if st := op.Status(context.Background()); !st.Open || st.LastError != "" {
+		t.Fatalf("status after reopen: %+v", st)
+	}
+	if _, err := op.Exec(context.Background(), "UPDATE t SET x=1"); err != nil {
+		t.Fatalf("Exec after reopen: %v", err)
+	}
+}
+
+// TestSQLOp_StatusLazilyOpens covers G4③: validate_config's Status call
+// must attempt a real open/ping instead of replaying startup state.
+func TestSQLOp_StatusLazilyOpens(t *testing.T) {
+	registerFakeDBDriverOnce.Do(func() { sql.Register("dbop-fake", dbopFakeDriver{}) })
+	op := newLazyTestOp(func(_, dsn string) (*sql.DB, error) { return sql.Open("dbop-fake", dsn) })
+	st := op.Status(context.Background())
+	if !st.Open {
+		t.Fatalf("Status should lazily open, got %+v", st)
 	}
 }
 

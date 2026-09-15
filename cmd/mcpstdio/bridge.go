@@ -209,22 +209,37 @@ func (b *Bridge) handleToolsCall(req *jsonrpcRequest, out *json.Encoder, stderr 
 		b.writeErr(out, req.ID, -32602, "invalid params", err.Error())
 		return
 	}
-	if _, ok := p["name"]; !ok {
+	nameRaw, ok := p["name"]
+	if !ok {
 		b.writeErr(out, req.ID, -32602, "missing tool name", "")
+		return
+	}
+	var toolName string
+	if err := json.Unmarshal(nameRaw, &toolName); err != nil || toolName == "" {
+		b.writeErr(out, req.ID, -32602, "invalid tool name", "")
 		return
 	}
 
 	cid, err := b.resolveClientID(context.Background(), stderr)
 	if err != nil {
-		b.writeErr(out, req.ID, -32004, "client_id unresolved", err.Error())
-		return
+		// Server-local tools (e.g. report_problem) run on server.exe itself
+		// and must work with zero or many helpers connected. Ask the server
+		// whether it owns this tool before giving up on client resolution.
+		if !b.isServerTool(context.Background(), toolName) {
+			b.writeErr(out, req.ID, -32004, "client_id unresolved", err.Error())
+			return
+		}
+		fmt.Fprintf(stderr,
+			"bridge: %q is a server-local tool; forwarding without client_id (%v)\n",
+			toolName, err)
+	} else {
+		quoted, err := json.Marshal(cid)
+		if err != nil {
+			b.writeErr(out, req.ID, -32603, "internal error", err.Error())
+			return
+		}
+		p["client_id"] = quoted
 	}
-	quoted, err := json.Marshal(cid)
-	if err != nil {
-		b.writeErr(out, req.ID, -32603, "internal error", err.Error())
-		return
-	}
-	p["client_id"] = quoted
 
 	forwarded, err := json.Marshal(jsonrpcRequest{
 		JSONRPC: "2.0",
@@ -294,9 +309,10 @@ func (b *Bridge) handleToolsCall(req *jsonrpcRequest, out *json.Encoder, stderr 
 }
 
 // fetchTools returns the tool list for whichever helper the bridge is
-// pinned to. It calls /mcp/tools?client_id=X when ClientID is known;
-// otherwise it pulls the aggregated view and picks the single client
-// (rejecting ambiguity).
+// pinned to (plus the server-local tools). It calls /mcp/tools?client_id=X
+// when ClientID is known; otherwise it pulls the aggregated view and picks
+// the single client. Server-local tools stay visible even with zero or
+// multiple helpers connected.
 func (b *Bridge) fetchTools(ctx context.Context, stderr io.Writer) ([]toolMeta, error) {
 	if b.ClientID != "" {
 		return b.fetchToolsFor(ctx, b.ClientID)
@@ -306,7 +322,8 @@ func (b *Bridge) fetchTools(ctx context.Context, stderr io.Writer) ([]toolMeta, 
 		return nil, err
 	}
 	var agg struct {
-		Clients []struct {
+		ServerTools []toolMeta `json:"server_tools"`
+		Clients     []struct {
 			ClientID string     `json:"client_id"`
 			Tools    []toolMeta `json:"tools"`
 		} `json:"clients"`
@@ -316,16 +333,25 @@ func (b *Bridge) fetchTools(ctx context.Context, stderr io.Writer) ([]toolMeta, 
 	}
 	switch len(agg.Clients) {
 	case 0:
+		if len(agg.ServerTools) > 0 {
+			return agg.ServerTools, nil
+		}
 		return nil, fmt.Errorf("no helper connected to %s", b.URL)
 	case 1:
-		return agg.Clients[0].Tools, nil
+		return mergeTools(agg.Clients[0].Tools, agg.ServerTools), nil
 	default:
+		if len(agg.ServerTools) == 0 {
+			fmt.Fprintf(stderr,
+				"bridge: %d helpers connected; set MCP_CLIENT_ID to disambiguate\n",
+				len(agg.Clients))
+			return nil, fmt.Errorf(
+				"multiple helpers connected (%d); set MCP_CLIENT_ID",
+				len(agg.Clients))
+		}
 		fmt.Fprintf(stderr,
-			"bridge: %d helpers connected; set MCP_CLIENT_ID to disambiguate\n",
+			"bridge: %d helpers connected; hiding helper tools until MCP_CLIENT_ID is set\n",
 			len(agg.Clients))
-		return nil, fmt.Errorf(
-			"multiple helpers connected (%d); set MCP_CLIENT_ID",
-			len(agg.Clients))
+		return agg.ServerTools, nil
 	}
 }
 
@@ -335,12 +361,44 @@ func (b *Bridge) fetchToolsFor(ctx context.Context, cid string) ([]toolMeta, err
 		return nil, err
 	}
 	var resp struct {
-		Tools []toolMeta `json:"tools"`
+		ServerTools []toolMeta `json:"server_tools"`
+		Tools       []toolMeta `json:"tools"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("decode /mcp/tools: %w", err)
 	}
-	return resp.Tools, nil
+	return mergeTools(resp.Tools, resp.ServerTools), nil
+}
+
+// isServerTool asks the upstream server whether it executes name itself.
+// It only reports true on a successful lookup; any transport/decoding error
+// means "treat as a helper tool" so the caller surfaces the original error.
+func (b *Bridge) isServerTool(ctx context.Context, name string) bool {
+	body, err := b.getJSON(ctx, "/mcp/tools")
+	if err != nil {
+		return false
+	}
+	var agg struct {
+		ServerTools []toolMeta `json:"server_tools"`
+	}
+	if err := json.Unmarshal(body, &agg); err != nil {
+		return false
+	}
+	for _, t := range agg.ServerTools {
+		if t.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeTools concatenates helper and server-local tools without aliasing the
+// input slices. Helper tools keep their position so the visible ordering is
+// stable across polls.
+func mergeTools(helper, server []toolMeta) []toolMeta {
+	out := make([]toolMeta, 0, len(helper)+len(server))
+	out = append(out, helper...)
+	return append(out, server...)
 }
 
 // resolveClientID returns the helper id to stamp on outgoing calls. It

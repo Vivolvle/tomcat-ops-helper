@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -121,12 +123,48 @@ func TestExtractPaths(t *testing.T) {
 		{"cmd /C \"rmdir /S /Q E:\\foo\"", []string{`E:\foo`}},
 		{"dir /S /B E:\\foo", []string{`E:\foo`}},
 		{"if exist E:\\foo (echo X) else (echo Y)", []string{`E:\foo`}},
+		// Quoted paths with spaces are ONE path, not two tokens (G2).
+		{`"D:\Program Files\MySql\bin\mysqld.exe" --install MYSQL80`,
+			[]string{`D:\Program Files\MySql\bin\mysqld.exe`}},
+		{`--defaults-file="D:\Program Files\MySql\my.ini"`,
+			[]string{`D:\Program Files\MySql\my.ini`}},
+		{`del /q "E:\bs-esb\cleanup.cmd"`, []string{`E:\bs-esb\cleanup.cmd`}},
+		// Quotes that merely wrap a command must not swallow the path.
+		{`cmd /C "rmdir /S /Q E:\foo"`, []string{`E:\foo`}},
+		// tasklist-style quoted arguments contain no paths at all.
+		{`tasklist /fi "imagename eq helper.exe"`, []string{}},
 	}
 	for _, c := range cmds {
 		got := ExtractPaths(c.in)
 		if !sameStrings(got, c.want) {
 			t.Errorf("ExtractPaths(%q) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestCheckAllowedPaths_QuotedPaths covers the G2 false denial: a
+// whitelisted path containing spaces, written with quotes, must pass.
+func TestCheckAllowedPaths_QuotedPaths(t *testing.T) {
+	cfg := mustConfig(t)
+	sub := filepath.Join(cfg.AllowedDirs[0], "Program Files", "MySql")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	quotedOK := `"` + filepath.Join(sub, "mysqld.exe") + `" --install MYSQL80`
+	if err := CheckAllowedPaths(cfg, quotedOK); err != nil {
+		t.Fatalf("quoted allowed path rejected: %v", err)
+	}
+	// A path outside allowed_dirs must still be caught.
+	outsidePath := `C:\Windows\System32\cmd.exe`
+	if runtime.GOOS != "windows" {
+		outsidePath = `/etc/shadow`
+	}
+	if err := CheckAllowedPaths(cfg, `"`+outsidePath+`"`); err == nil {
+		t.Fatal("expected denial for path outside allowed_dirs")
+	}
+	// Quotes with no paths are always fine.
+	if err := CheckAllowedPaths(cfg, `tasklist /fi "imagename eq helper.exe"`); err != nil {
+		t.Fatalf("quoted non-path rejected: %v", err)
 	}
 }
 
@@ -250,5 +288,59 @@ func TestOSRunner_RunsRealCommand(t *testing.T) {
 	}
 	if !strings.Contains(res.Stdout, "hi") {
 		t.Fatalf("stdout missing 'hi': %q", res.Stdout)
+	}
+}
+
+// TestOSRunner_PreservesQuoting is the regression test for the
+// 2026-09-15 G2/G3 report: Go's per-argument escaping mangled quotes on
+// the way into `cmd /C`, so tasklist filters lost their quotes and a
+// PowerShell -Command string was echoed instead of executed. With the
+// raw CmdLine the quoting arrives intact.
+func TestOSRunner_PreservesQuoting(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("cmd.exe quoting is Windows-specific")
+	}
+	cfg := mustConfig(t)
+	r := NewOSRunner()
+	cases := []struct {
+		name      string
+		cmd       string
+		wantIn    string
+		wantNotIn string
+	}{
+		{
+			name:   "double quotes survive",
+			cmd:    `echo "a b"`,
+			wantIn: `"a b"`,
+		},
+		{
+			name:   "quoted comparison executes",
+			cmd:    `if "a b"=="a b" echo quoted-ok`,
+			wantIn: "quoted-ok",
+		},
+		{
+			name:      "powershell -Command is executed, not echoed",
+			cmd:       `powershell -NoProfile -NonInteractive -Command "Write-Output 'hello world'"`,
+			wantIn:    "hello world",
+			wantNotIn: "Write-Output",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			name, args := splitCommand(c.cmd)
+			res, err := r.Run(context.Background(), name, args, cfg.AllowedDirs[0])
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if res.ExitCode != 0 {
+				t.Fatalf("exit = %d, stderr=%q stdout=%q", res.ExitCode, res.Stderr, res.Stdout)
+			}
+			if !strings.Contains(res.Stdout, c.wantIn) {
+				t.Fatalf("stdout missing %q: %q", c.wantIn, res.Stdout)
+			}
+			if c.wantNotIn != "" && strings.Contains(res.Stdout, c.wantNotIn) {
+				t.Fatalf("stdout should not echo the command, got %q", res.Stdout)
+			}
+		})
 	}
 }

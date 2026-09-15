@@ -66,6 +66,7 @@ func TestMcpEndToEnd(t *testing.T) {
 	_ = conn.WriteJSON((protocol.ToolList{Tools: []protocol.ToolMeta{
 		{Name: "status", Description: "x", InputSchema: json.RawMessage(`{"type":"object"}`)},
 		{Name: "echo", Description: "y", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		{Name: "fail", Description: "always fails", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}}).ToEnvelope())
 
 	// Wait for tool list to register.
@@ -80,7 +81,7 @@ func TestMcpEndToEnd(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	mu.Lock()
-	if len(seenTools) != 2 {
+	if len(seenTools) != 3 {
 		mu.Unlock()
 		t.Fatalf("tool list not registered; got %d", len(seenTools))
 	}
@@ -103,6 +104,9 @@ func TestMcpEndToEnd(t *testing.T) {
 			gotCmd = cmd
 			mu.Unlock()
 			res := protocol.Result{ID: cmd.ID, Success: true, Data: json.RawMessage(`{"hostname":"testbox"}`)}
+			if cmd.Action == "fail" {
+				res = protocol.Result{ID: cmd.ID, Success: false, Error: `work dir not allowed: C:\tomcat`}
+			}
 			_ = conn.WriteJSON(res.ToEnvelope())
 			select {
 			case gotCmdCh <- struct{}{}:
@@ -156,6 +160,23 @@ func TestMcpEndToEnd(t *testing.T) {
 		t.Fatalf("helper got action = %s", gotCmd.Action)
 	}
 	mu.Unlock()
+
+	// A failing helper tool must carry its reason in the JSON-RPC
+	// message (G1): clients surface `message`, not `data`.
+	failing := `{"jsonrpc":"2.0","id":"x3","method":"tools/call","params":{"name":"fail","client_id":"test"}}`
+	resp3, err := http.Post(srv.URL+"/mcp/call", "application/json", strings.NewReader(failing))
+	if err != nil {
+		t.Fatalf("post3: %v", err)
+	}
+	defer resp2BodyClose(resp3)
+	var rpcFail jsonrpcResponse
+	_ = json.NewDecoder(resp3.Body).Decode(&rpcFail)
+	if rpcFail.Error == nil {
+		t.Fatalf("expected error from failing tool")
+	}
+	if !strings.Contains(rpcFail.Error.Message, `work dir not allowed: C:\tomcat`) {
+		t.Fatalf("error message must carry the helper reason, got %q", rpcFail.Error.Message)
+	}
 
 	// And unknown tool should be rejected by /mcp/call.
 	bad := `{"jsonrpc":"2.0","id":"x2","method":"tools/call","params":{"name":"missing","client_id":"test"}}`

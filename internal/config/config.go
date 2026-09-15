@@ -209,6 +209,10 @@ type ServerConfig struct {
 	Tokens      []string `json:"tokens"`
 	AuditLog    string   `json:"audit_log"`
 	AgentListen string   `json:"agent_listen"`
+	// ProblemLog is the markdown file that the server-local `report_problem`
+	// MCP tool appends to. Relative paths resolve against server.exe's
+	// working directory. Defaults to "problem.md".
+	ProblemLog string `json:"problem_log"`
 }
 
 // LoadHelper reads config.json from path and validates it.
@@ -380,6 +384,7 @@ func LoadServer(path string) (*ServerConfig, error) {
 		Listen:      ":443",
 		AgentListen: "127.0.0.1:7777",
 		AuditLog:    "audit.log",
+		ProblemLog:  "problem.md",
 	}
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse server config: %w", err)
@@ -405,6 +410,12 @@ func (s *ServerConfig) Validate() error {
 		if len(t) < 8 {
 			return fmt.Errorf("tokens[%d] too short", i)
 		}
+	}
+	if s.ProblemLog == "" {
+		s.ProblemLog = "problem.md"
+	}
+	if abs, err := filepath.Abs(s.ProblemLog); err == nil {
+		s.ProblemLog = abs
 	}
 	return nil
 }

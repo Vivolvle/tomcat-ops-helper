@@ -327,4 +327,42 @@
 - E2 写个 dump-tools 子命令 / TestPostConnectToolList_IsValidJSON
 - F1 看 server 协议处理
 
+---
+
+# 2026-09-15 第三次实战（客户机全装 MySQL 8.0.45，全程只走 helper）
+
+场景：zip 解压 → 初始化 datadir → 注册 MYSQL80 服务 → 改 root/yc1234! + native password →
+防火墙放行 → 清理临时脚本。`write_file` / `upload_file` 都很好用；问题基本集中在
+**exec 通道**和 **DB connector 生命周期**两块。
+
+> **2026-09-15 修复轮**：G1 / G2 / G3 / G4①③ 已修（回归测试全过）；
+> 遗留 open：G4② `reload_config`、H1 `read_file`、H2 `list_logs` 列目录、I1 `run_script`。
+
+## G. exec / 命令通道
+
+- [ ] **G4② — reload_config：不重启 helper 重读 config.json / 重建 DB connector / 刷新 Tools()**
+  需动 helper 主流程 + wsclient 重发 ToolList，留待下一轮。
+
+## H. 文件读写
+
+- [ ] **H1 — 没有 `read_file`，只有 `tail`**
+  本次要读 `config.json` / `README.md` / `helper.log`（都在 allowed_dirs 内），只能
+  `tail -n 200` 兜：不能从头读、不能按行区间取，对非日志文件语义别扭。
+  期望：`read_file{path, offset?, limit?}`，白名单校验 + 字节上限 + 超限截断标记
+  （复用 write_file 的路径检查即可）。
+
+- [ ] **H2 — `list_logs` 不列子目录**
+  现象：列 `E:\bs-esb` 时只返回文件，`helper-client\`（目录）不出现；`dir /b` 可见。
+  期望：目录项也返回（`type:"dir"` + mtime），或加语义更准的 `list_dir`。
+  （`list_logs` 这名字会误导，我一开始以为它只服务 log_dir。）
+
+## I. 锦上添花（可选）
+
+- [ ] **I1 — exec 增加脚本模式 / `run_script`（C2 延伸）**
+  本轮几乎每条复杂命令都要"write_file 落 .cmd → exec 跑"两步；cmd 不支持 `;`/`&`/`|`/`>`
+  没法一句话办多事，还踩过 `del a; dir b` 被当成单个 del、`/b` 变成 del 的非法开关
+  （`Invalid switch - "b"`）这种歧义坑。
+  期望：exec 收到多行 `script` 参数时自动写临时脚本→执行→回读输出→清理；或独立
+  `run_script` action。仍受 allowed_dirs + 超时 + 输出截断约束。
+
 

@@ -29,6 +29,10 @@ type fakeServer struct {
 	// to simulate helpers joining/leaving or advertising new tools.
 	toolsFn atomic.Value // func() []toolMeta
 
+	// serverTools is the server-local tool list (the `server_tools` field
+	// of /mcp/tools). Empty by default.
+	serverTools atomic.Value // []toolMeta
+
 	callMode atomic.Value // "ok", "tool-error", "non-json"
 }
 
@@ -37,6 +41,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	f := &fakeServer{}
 	f.toolsMode.Store("single")
 	f.pinnedID.Store("helper-A")
+	f.serverTools.Store([]toolMeta{})
 	f.callMode.Store("ok")
 
 	mux := http.NewServeMux()
@@ -56,8 +61,13 @@ func (f *fakeServer) currentTools() []toolMeta {
 	return cannedTools
 }
 
+func (f *fakeServer) currentServerTools() []toolMeta {
+	return f.serverTools.Load().([]toolMeta)
+}
+
 func (f *fakeServer) handleTools(w http.ResponseWriter, r *http.Request) {
 	tools := f.currentTools()
+	serverTools := f.currentServerTools()
 	if cid := r.URL.Query().Get("client_id"); cid != "" {
 		// Pinned view.
 		if cid != f.pinnedID.Load().(string) {
@@ -65,22 +75,28 @@ func (f *fakeServer) handleTools(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"client_id": cid,
-			"tools":     tools,
+			"client_id":    cid,
+			"server_tools": serverTools,
+			"tools":        tools,
 		})
 		return
 	}
 	switch f.toolsMode.Load().(string) {
 	case "none":
-		writeJSON(w, http.StatusOK, map[string]any{"clients": []any{}})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"server_tools": serverTools,
+			"clients":      []any{},
+		})
 	case "single":
 		writeJSON(w, http.StatusOK, map[string]any{
+			"server_tools": serverTools,
 			"clients": []map[string]any{
 				{"client_id": f.pinnedID.Load().(string), "tools": tools},
 			},
 		})
 	case "multi":
 		writeJSON(w, http.StatusOK, map[string]any{
+			"server_tools": serverTools,
 			"clients": []map[string]any{
 				{"client_id": "helper-A", "tools": tools},
 				{"client_id": "helper-B", "tools": tools},
@@ -136,6 +152,12 @@ var cannedTools = []toolMeta{
 		Description: "Run a shell command",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}`),
 	},
+}
+
+var reportProblemToolMeta = toolMeta{
+	Name:        "report_problem",
+	Description: "Report a problem to the operator",
+	InputSchema: json.RawMessage(`{"type":"object","properties":{"description":{"type":"string"}},"required":["description"]}`),
 }
 
 // runBridge feeds `input` line-by-line into a Bridge pointed at the fake
@@ -260,6 +282,110 @@ func TestBridge_ToolsList_MultiHelper_WithClientID_OK(t *testing.T) {
 	res := got["result"].(map[string]any)
 	if len(res["tools"].([]any)) != 2 {
 		t.Fatalf("tools len = %v", res["tools"])
+	}
+}
+
+func TestBridge_ToolsList_NoHelper_ServerToolsVisible(t *testing.T) {
+	f := newFakeServer(t)
+	f.toolsMode.Store("none")
+	f.serverTools.Store([]toolMeta{reportProblemToolMeta})
+	stdout, _ := runBridge(t, f,
+		`{"jsonrpc":"2.0","id":20,"method":"tools/list"}`+"\n",
+		"")
+	got := parseLine(t, stdout, `{"jsonrpc":"2.0"`)
+	if _, ok := got["error"]; ok {
+		t.Fatalf("unexpected error: %v", got["error"])
+	}
+	tools := got["result"].(map[string]any)["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "report_problem" {
+		t.Fatalf("tools = %v", tools)
+	}
+}
+
+func TestBridge_ToolsList_SingleHelper_MergesServerTools(t *testing.T) {
+	f := newFakeServer(t)
+	f.serverTools.Store([]toolMeta{reportProblemToolMeta})
+	stdout, _ := runBridge(t, f,
+		`{"jsonrpc":"2.0","id":21,"method":"tools/list"}`+"\n",
+		"")
+	got := parseLine(t, stdout, `{"jsonrpc":"2.0"`)
+	tools := got["result"].(map[string]any)["tools"].([]any)
+	if len(tools) != 3 {
+		t.Fatalf("tools len = %d, want 3: %v", len(tools), tools)
+	}
+	if tools[2].(map[string]any)["name"] != "report_problem" {
+		t.Fatalf("server tool should come last: %v", tools)
+	}
+}
+
+func TestBridge_ToolsList_Pinned_MergesServerTools(t *testing.T) {
+	f := newFakeServer(t)
+	f.serverTools.Store([]toolMeta{reportProblemToolMeta})
+	stdout, _ := runBridge(t, f,
+		`{"jsonrpc":"2.0","id":22,"method":"tools/list"}`+"\n",
+		"helper-A")
+	got := parseLine(t, stdout, `{"jsonrpc":"2.0"`)
+	tools := got["result"].(map[string]any)["tools"].([]any)
+	if len(tools) != 3 || tools[2].(map[string]any)["name"] != "report_problem" {
+		t.Fatalf("tools = %v", tools)
+	}
+}
+
+func TestBridge_ToolsList_MultiHelper_ServerToolsStillVisible(t *testing.T) {
+	f := newFakeServer(t)
+	f.toolsMode.Store("multi")
+	f.serverTools.Store([]toolMeta{reportProblemToolMeta})
+	stdout, _ := runBridge(t, f,
+		`{"jsonrpc":"2.0","id":23,"method":"tools/list"}`+"\n",
+		"")
+	got := parseLine(t, stdout, `{"jsonrpc":"2.0"`)
+	if _, ok := got["error"]; ok {
+		t.Fatalf("unexpected error: %v", got["error"])
+	}
+	tools := got["result"].(map[string]any)["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "report_problem" {
+		t.Fatalf("tools = %v", tools)
+	}
+}
+
+func TestBridge_ToolsCall_ServerTool_NoHelper(t *testing.T) {
+	f := newFakeServer(t)
+	f.toolsMode.Store("none")
+	f.serverTools.Store([]toolMeta{reportProblemToolMeta})
+	stdout, _ := runBridge(t, f,
+		`{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"report_problem","arguments":{"description":"x"}}}`+"\n",
+		"")
+	got := parseLine(t, stdout, `{"jsonrpc":"2.0"`)
+	if _, ok := got["error"]; ok {
+		t.Fatalf("unexpected error: %v", got["error"])
+	}
+	gotBody := f.gotCallBody.Load().(string)
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &sent); err != nil {
+		t.Fatalf("decode forwarded body: %v\n%s", err, gotBody)
+	}
+	params := sent["params"].(map[string]any)
+	if params["name"] != "report_problem" {
+		t.Fatalf("name = %v", params["name"])
+	}
+	if _, hasCID := params["client_id"]; hasCID {
+		t.Fatalf("server-local call must not carry client_id: %v", params)
+	}
+}
+
+func TestBridge_ToolsCall_HelperTool_NoHelper_StillErrors(t *testing.T) {
+	f := newFakeServer(t)
+	f.toolsMode.Store("none")
+	f.serverTools.Store([]toolMeta{reportProblemToolMeta})
+	stdout, _ := runBridge(t, f,
+		`{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"status"}}`+"\n",
+		"")
+	got := parseLine(t, stdout, `{"jsonrpc":"2.0"`)
+	if _, ok := got["error"]; !ok {
+		t.Fatalf("expected client_id resolution error, got %v", got)
+	}
+	if v := f.gotCallBody.Load(); v != nil {
+		t.Fatalf("helper tool must not be forwarded without a client: %v", v)
 	}
 }
 

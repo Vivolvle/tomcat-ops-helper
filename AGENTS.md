@@ -15,9 +15,11 @@ locally and drives it via HTTP. See `docs/需求文档.md`, `docs/设计文档.m
 ```
 cmd/helper/    customer-side process (reverse-wss client)
 cmd/server/    operator-side wss relay + HTTP bridge
+cmd/server/server_tools.go   server-local MCP tools (report_problem)
 cmd/mcpstdio/  MCP-over-stdio bridge → server.exe /mcp/* (for MCP Inspector / opencode)
 cmd/gencert/   one-shot self-signed cert generator for local testing
 todo.md        live list of MCP capability gaps surfaced during testing
+problem.md     usage-friction log written by the server-local report_problem tool
 internal/protocol/   Envelope / Hello / ToolList / Command / Result JSON types
 internal/config/     config.json load + Validate
 internal/execshell/  controlled shell: Runner interface, blacklist, audit
@@ -29,9 +31,16 @@ internal/wsserver/   wss server with Hello / Result / ToolList routing
 Three binaries: `helper.exe`, `server.exe`, plus `gencert` is `go run`'d.
 `mcpstdio` is `go run`'d (it is intended to be launched by MCP Inspector).
 
-Tools live on the helper. Server only relays — it caches each helper's
-`ToolList` and exposes them via JSON-RPC. Adding a new tool means **only**
-editing helper, never server.
+Helper tools live on the helper. Server only relays — it caches each helper's
+`ToolList` and exposes them via JSON-RPC. Adding a new helper tool means
+**only** editing helper, never server.
+
+Exception: server-local tools (currently just `report_problem`) run inside
+`server.exe` with no helper round-trip and work with **zero helpers
+connected**. They live in `cmd/server/server_tools.go`, are advertised under
+the top-level `server_tools` key of `/mcp/tools`, and are intercepted by
+`/mcp/call` before any client_id resolution. See `problem.md` for the log they
+write.
 
 ## MCP test rules (read this when driving the helper via MCP)
 
@@ -55,6 +64,11 @@ Inspector, opencode, or any other MCP client), follow these rules:
   Tell the user briefly that it was logged, then keep doing whatever else is
   possible. `todo.md` is a temporary capability-gap log; collapse it into the
   real requirements once testing settles.
+- **Feedback goes through `report_problem`.** If a tool is missing, awkward,
+  or misbehaving, call the server-local `report_problem` tool (works even when
+  no helper is connected) instead of only mentioning it in chat or silently
+  working around it. Entries are appended to `problem.md` (same directory as
+  `todo.md`), which the operator reviews periodically.
 - For the `exec` tool: Windows paths in arguments **must** use `\\` (JSON
   escaping). The bridge itself enforces `work_dir` against the helper's
   `allowed_dirs` whitelist — getting `work dir not allowed` is correct
@@ -104,7 +118,9 @@ function instead of writing to disk.
     envelope. Sniffs body for JSON before falling back to form.
   - `GET /clients`, `GET /health`.
   - `GET /mcp/tools` — `?client_id=c-1` for one helper, omit for aggregated
-    list across every connected client.
+    list across every connected client. Both shapes carry a top-level
+    `server_tools` array (currently just `report_problem`); `clients[].tools`
+    stays helper-only.
   - `POST /mcp/call` — JSON-RPC 2.0 `tools/call`. Body:
     ```json
     {"jsonrpc":"2.0","id":"1","method":"tools/call",
@@ -112,6 +128,8 @@ function instead of writing to disk.
     ```
     `client_id` is optional only when exactly one helper is connected.
     Unknown tool names are rejected with `-32602` before any WS round-trip.
+    Server-local tools (names in `server_tools`) ignore `client_id`, run
+    in-process, and work with zero helpers connected.
 - wss server listens on `listen` (default `:8443` in this repo's `server.json`
   to avoid needing admin for `:443`). Helper connects via `server_url`.
 - Optional `ws_listen` (e.g. `127.0.0.1:8444`) starts a second **plain WS**
@@ -123,6 +141,9 @@ function instead of writing to disk.
   Server caches the tool list keyed by `Hello.ClientID`. The temporary `c-N`
   id assigned at upgrade is replaced by `Hello.ClientID` so `/mcp/call`
   parameters match.
+- `server.json` may set `problem_log` (default `problem.md`, resolved against
+  server.exe's working directory). That is the file `report_problem` appends
+  to; the helper never sees it.
 - Token in `config.json` **must match** a token in `server.json`'s `tokens[]`.
 - Helper logs go to stdout and to `helper.log` (audit). Server writes
   `audit.log` JSONL.
@@ -144,6 +165,11 @@ curl -k http://127.0.0.1:7777/mcp/tools
 curl -k -X POST -H "Content-Type: application/json" ^
   http://127.0.0.1:7777/mcp/call ^
   -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"client_id\":\"helper-sijing\"}}"
+
+# Server-local tool: works with zero helpers connected; appends to problem.md.
+curl -k -X POST -H "Content-Type: application/json" ^
+  http://127.0.0.1:7777/mcp/call ^
+  -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"report_problem\",\"arguments\":{\"description\":\"what was awkward\",\"source\":\"my-agent\"}}}"
 ```
 
 If curl returns `bad request` or `action is required`, the server binary is
@@ -330,8 +356,13 @@ advertised in its `ToolList`. To ship a new capability:
    Server is unchanged; it will pick up the new ToolList the next time the
    helper reconnects (or just bounce helper in place).
 
-If you accidentally edit server code thinking a new tool belongs there —
-undo that. The server has no per-tool logic; it only relays.
+If you accidentally edit server code thinking a new helper tool belongs
+there — undo that. The server has no per-helper-tool logic; it only relays.
+
+The one sanctioned exception is a **server-local tool** (e.g.
+`report_problem` in `cmd/server/server_tools.go`) that must work with no
+helper online. Add those to `serverToolDefs()`, handle them in
+`executeServerTool()`, and test them in `cmd/server/problem_test.go`.
 
 ## Common traps
 

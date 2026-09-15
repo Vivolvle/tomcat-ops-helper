@@ -88,8 +88,17 @@ func NewSQLOpWithOpen(ctx context.Context, cfg *config.DBConfig, open func(drive
 }
 
 // Status returns the cached health snapshot, refreshing Open / LatencyMs
-// by issuing a Ping if the pool is currently considered open.
+// by issuing a Ping if the pool is currently considered open. When the
+// pool was never opened (startup ping failed), Status attempts a lazy
+// reconnect first — the 2026-09-15 G4 report showed validate_config
+// replaying a stale "connection refused" forever after MySQL came up.
 func (o *SQLOp) Status(ctx context.Context) Status {
+	o.mu.Lock()
+	hasDB := o.db != nil
+	o.mu.Unlock()
+	if !hasDB {
+		_ = o.ensureOpen(ctx) // best-effort; records any error in status
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.db != nil {
@@ -220,12 +229,30 @@ func (o *SQLOp) markLocked(err error) {
 	o.status.LastErrorAt = &now
 }
 
-func (o *SQLOp) runQuery(ctx context.Context, sqlText string, maxRows int) (QueryResult, error) {
+// dbHandle returns the live pool, lazily opening it when the startup
+// ping failed or the pool was torn down. This is the 2026-09-15 G4① fix:
+// previously Query/Exec returned "connector not open" forever when MySQL
+// was not yet installed when the helper started.
+func (o *SQLOp) dbHandle(ctx context.Context) (*sql.DB, error) {
 	o.mu.Lock()
 	db := o.db
 	o.mu.Unlock()
-	if db == nil {
-		return QueryResult{}, errors.New("dbop: connector not open")
+	if db != nil {
+		return db, nil
+	}
+	if err := o.ensureOpen(ctx); err != nil {
+		return nil, err
+	}
+	o.mu.Lock()
+	db = o.db
+	o.mu.Unlock()
+	return db, nil
+}
+
+func (o *SQLOp) runQuery(ctx context.Context, sqlText string, maxRows int) (QueryResult, error) {
+	db, err := o.dbHandle(ctx)
+	if err != nil {
+		return QueryResult{}, err
 	}
 	start := time.Now()
 	rows, err := db.QueryContext(ctx, sqlText)
@@ -296,11 +323,9 @@ func (o *SQLOp) runQuery(ctx context.Context, sqlText string, maxRows int) (Quer
 }
 
 func (o *SQLOp) runExec(ctx context.Context, sqlText string) (ExecResult, error) {
-	o.mu.Lock()
-	db := o.db
-	o.mu.Unlock()
-	if db == nil {
-		return ExecResult{}, errors.New("dbop: connector not open")
+	db, err := o.dbHandle(ctx)
+	if err != nil {
+		return ExecResult{}, err
 	}
 	start := time.Now()
 	res, err := db.ExecContext(ctx, sqlText)

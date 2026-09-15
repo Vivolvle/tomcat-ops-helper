@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -261,6 +262,23 @@ func TestLoadServer_Defaults(t *testing.T) {
 	}
 	if cfg.AuditLog != "audit.log" {
 		t.Fatalf("default audit log = %s", cfg.AuditLog)
+	}
+	if !strings.HasSuffix(cfg.ProblemLog, "problem.md") {
+		t.Fatalf("default problem log = %s", cfg.ProblemLog)
+	}
+}
+
+func TestLoadServer_ProblemLog(t *testing.T) {
+	body := `{
+		"tls_cert":"/c","tls_key":"/k","tokens":["longenough1"],
+		"problem_log":"D:\\ops\\problems.md"
+	}`
+	cfg, err := LoadServer(writeTempConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadServer: %v", err)
+	}
+	if cfg.ProblemLog != `D:\ops\problems.md` {
+		t.Fatalf("problem log = %s", cfg.ProblemLog)
 	}
 }
 

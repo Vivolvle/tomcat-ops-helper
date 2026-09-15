@@ -50,6 +50,7 @@ func main() {
 		logger.SetOutput(os.Stderr)
 	}
 	logger.Printf("helper %s starting; server=%s", helperVersion, cfg.ServerURL)
+	logStartupWarnings(logger, cfg)
 
 	// Audit log: append JSONL entries per executed command.
 	auditPath := cfg.LogFile
@@ -146,6 +147,35 @@ func main() {
 		fatal(err)
 	}
 	logger.Printf("helper: stopped")
+}
+
+// logStartupWarnings surfaces missing/invalid configured paths right in
+// the helper log. The 2026-09-15 report (todo G1③) showed the operator
+// guessing for six calls why exec kept failing: cfg.tomcat_home did not
+// exist and was not in allowed_dirs, which only the deep error path
+// mentioned.
+func logStartupWarnings(logger *log.Logger, cfg *config.HelperConfig) {
+	bad := 0
+	check := func(label, path string) {
+		st, err := os.Stat(path)
+		switch {
+		case err != nil:
+			bad++
+			logger.Printf("warn: %s not found: %s (%v)", label, path, err)
+		case !st.IsDir():
+			bad++
+			logger.Printf("warn: %s is not a directory: %s", label, path)
+		}
+	}
+	check("tomcat_home", cfg.TomcatHome)
+	check("jdk_home", cfg.JDKHome)
+	check("log_dir", cfg.LogDir)
+	for _, d := range cfg.AllowedDirs {
+		check("allowed_dirs entry", d)
+	}
+	if bad > 0 {
+		logger.Printf("warn: %d configured path(s) missing or invalid; exec calls without work_dir fall back to the first existing allowed_dirs entry", bad)
+	}
 }
 
 func dispatch(ctx context.Context, reg *actions.Registry, cmd protocol.Command) protocol.Result {

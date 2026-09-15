@@ -23,6 +23,7 @@ func (r *OSRunner) Run(ctx context.Context, name string, args []string, workDir 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cmd := exec.CommandContext(ctx, name, args...)
+	configureCmdLine(cmd, name, args)
 	if workDir != "" {
 		cmd.Dir = workDir
 	}

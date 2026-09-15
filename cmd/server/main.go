@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -40,7 +41,8 @@ func main() {
 	}
 
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
-	logger.Printf("server %s starting; listen=%s ws_listen=%q agent_listen=%s", serverVersion, cfg.Listen, cfg.WSListen, cfg.AgentListen)
+	logger.Printf("server %s starting; listen=%s ws_listen=%q agent_listen=%s problem_log=%s",
+		serverVersion, cfg.Listen, cfg.WSListen, cfg.AgentListen, cfg.ProblemLog)
 
 	auditFile, err := os.OpenFile(cfg.AuditLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -150,6 +152,9 @@ type relay struct {
 	clients map[string]*wsserver.Client
 	pending map[string]chan protocol.Result
 	tools   map[string][]protocol.ToolMeta // keyed by client_id
+
+	// problemMu serializes appends to the server-local problem log.
+	problemMu sync.Mutex
 }
 
 func newRelay(cfg *config.ServerConfig, logger *log.Logger, audit func(map[string]any)) *relay {
@@ -238,8 +243,9 @@ func (r *relay) handleMcpTools(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"client_id": cid,
-			"tools":     tools,
+			"client_id":    cid,
+			"server_tools": serverToolDefs(),
+			"tools":        tools,
 		})
 		return
 	}
@@ -250,7 +256,10 @@ func (r *relay) handleMcpTools(w http.ResponseWriter, req *http.Request) {
 			"tools":     tools,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"clients": aggregated})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"server_tools": serverToolDefs(),
+		"clients":      aggregated,
+	})
 }
 
 // handleMcpCall implements POST /mcp/call. Body is JSON-RPC 2.0:
@@ -298,15 +307,45 @@ func (r *relay) handleMcpCall(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Server-local tools run here, with no helper round-trip and no
+	// client_id requirement (they must work with zero helpers connected).
+	if isServerTool(p.Name) {
+		data, text, err := r.executeServerTool(p.Name, p.Arguments)
+		if err != nil {
+			code := -32000
+			if errors.Is(err, errInvalidArguments) {
+				code = -32602
+			}
+			writeJSONRPCError(w, env.ID, code, "server tool failed", err.Error())
+			return
+		}
+		r.audit(map[string]any{
+			"event": "server_tool",
+			"tool":  p.Name,
+			"ts":    time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		writeJSONRPCResult(w, env.ID, map[string]any{
+			"content": []map[string]any{{"type": "text", "text": text}},
+			"data":    json.RawMessage(data),
+		})
+		return
+	}
+
 	r.mu.Lock()
 	if p.ClientID == "" {
-		if len(r.clients) == 1 {
+		switch len(r.clients) {
+		case 0:
+			r.mu.Unlock()
+			writeJSONRPCError(w, env.ID, -32004, "no helper connected", "")
+			return
+		case 1:
 			for id := range r.clients {
 				p.ClientID = id
 			}
-		} else {
+		default:
 			r.mu.Unlock()
-			writeJSONRPCError(w, env.ID, -32004, "client_id required", "more than one helper connected")
+			writeJSONRPCError(w, env.ID, -32004, "client_id required",
+				fmt.Sprintf("%d helpers connected", len(r.clients)))
 			return
 		}
 	}
@@ -364,7 +403,15 @@ func (r *relay) handleMcpCall(w http.ResponseWriter, req *http.Request) {
 				"data":    json.RawMessage(res.Data),
 			})
 		} else {
-			writeJSONRPCError(w, env.ID, -32000, "tool execution failed", res.Error)
+			// Put the helper's reason in the message itself, not just in
+			// `data`: MCP clients surface `message` to the model and the
+			// 2026-09-15 report showed the real cause ("work dir not
+			// allowed: …") was invisible for six straight calls.
+			msg := "tool execution failed"
+			if s := strings.TrimSpace(res.Error); s != "" {
+				msg += ": " + s
+			}
+			writeJSONRPCError(w, env.ID, -32000, msg, res.Error)
 		}
 	case <-timer.C:
 		writeJSONRPCError(w, env.ID, -32001, "timeout", "")

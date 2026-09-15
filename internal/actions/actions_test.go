@@ -2,13 +2,16 @@ package actions
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"tomcat-ops-helper/internal/config"
 	"tomcat-ops-helper/internal/dbop"
@@ -565,28 +568,25 @@ func TestValidateConfig_WithConnectors(t *testing.T) {
 	}
 }
 
-// TestPowerShellWrap covers the helper that translates a plain
-// user command + work_dir into a single PowerShell -Command string.
-// The output is what gets handed to Executor.Exec; if quoting is
-// wrong, paths with spaces break (the original 2026-09-14 customer
-// box pain point where cmd /C ate the quoting on
-// "C:\Program Files\...").
+// TestPowerShellWrap covers the helper that translates a plain command +
+// work_dir into a single `powershell -EncodedCommand <base64>` string.
+// The output is what gets handed to Executor.Exec. Encoding is the fix
+// for the 2026-09-15 G3 report: the old plain `-Command "…"` wrapper was
+// echoed back instead of executed because cmd.exe ate the quoting.
 func TestPowerShellWrap(t *testing.T) {
+	const prefix = "powershell -NoProfile -NonInteractive -EncodedCommand "
 	cases := []struct {
-		name   string
-		cmd    string
-		work   string
-		must   []string // substrings that must appear
-		mustNot []string
+		name string
+		cmd  string
+		work string
+		must []string // substrings that must appear in the decoded script
 	}{
 		{
 			name: "plain",
 			cmd:  "Get-Process mysqld",
 			work: `D:\bs-esb`,
 			must: []string{
-				"powershell -NoProfile -NonInteractive -Command",
-				"Set-Location -LiteralPath 'D:\\bs-esb'",
-				"Get-Process mysqld",
+				`Set-Location -LiteralPath 'D:\bs-esb'; Get-Process mysqld`,
 			},
 		},
 		{
@@ -594,39 +594,155 @@ func TestPowerShellWrap(t *testing.T) {
 			cmd:  "Get-ChildItem",
 			work: `D:\Program Files\MySQL`,
 			must: []string{
-				"Set-Location -LiteralPath 'D:\\Program Files\\MySQL'",
-			},
-			// The wrapped string should still be one self-contained
-			// "powershell … -Command …" line so cmd /C cannot tokenize
-			// the inner arguments away.
-			mustNot: []string{
-				// No bare CR/LF in the middle (would break cmd /C).
-				"\r\n",
+				`Set-Location -LiteralPath 'D:\Program Files\MySQL'; Get-ChildItem`,
 			},
 		},
 		{
-			name: "single quote in user cmd is doubled",
+			name: "single quotes pass through verbatim",
 			cmd:  `Write-Output 'hello'`,
 			work: `D:\bs-esb`,
 			must: []string{
-				`Write-Output ''hello'`,
+				`Write-Output 'hello'`,
+			},
+		},
+		{
+			name: "double quotes and semicolons survive verbatim",
+			cmd:  `Write-Output "hello world"; Get-Process mysqld`,
+			work: `D:\bs-esb`,
+			must: []string{
+				`Write-Output "hello world"; Get-Process mysqld`,
 			},
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := powershellWrap(c.cmd, c.work)
-			for _, m := range c.must {
-				if !strings.Contains(got, m) {
-					t.Errorf("missing %q in: %s", m, got)
-				}
+			if !strings.HasPrefix(got, prefix) {
+				t.Fatalf("wrapper must be an -EncodedCommand line, got: %s", got)
 			}
-			for _, m := range c.mustNot {
-				if strings.Contains(got, m) {
-					t.Errorf("forbidden substring %q present in: %s", m, got)
+			// The whole point: no quotes / metacharacters for cmd.exe
+			// to mangle, and no raw newlines.
+			if strings.ContainsAny(got, `"&|<>;`+"\r\n") {
+				t.Fatalf("wrapped command must not contain cmd.exe metacharacters: %s", got)
+			}
+			raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(got, prefix))
+			if err != nil {
+				t.Fatalf("payload is not valid base64: %v", err)
+			}
+			script := utf16Decode(raw)
+			for _, m := range c.must {
+				if !strings.Contains(script, m) {
+					t.Errorf("missing %q in decoded script: %s", m, script)
 				}
 			}
 		})
+	}
+}
+
+// utf16Decode is the inverse of actions.utf16LEBytes, test-only.
+func utf16Decode(b []byte) string {
+	units := make([]uint16, len(b)/2)
+	for i := range units {
+		units[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
+	}
+	return string(utf16.Decode(units))
+}
+
+// TestExecAction_DefaultWorkDirFallsBack covers G1②: with a stale
+// tomcat_home (missing / not in allowed_dirs), exec without an explicit
+// work_dir must still run, in the first existing allowed_dirs entry, and
+// say so in the result.
+func TestExecAction_DefaultWorkDirFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.HelperConfig{
+		ServerURL:         "wss://x",
+		Token:             "longenough",
+		TomcatHome:        filepath.Join(dir, "no-such-tomcat"),
+		JDKHome:           dir,
+		LogDir:            dir,
+		AllowedDirs:       []string{dir},
+		CommandTimeout:    30 * time.Second,
+		MaxOutputSize:     4096,
+		ReconnectInterval: time.Second,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	reg := NewRegistry(cfg, execshell.NewExecutor(cfg).WithRunner(execshell.NewOSRunner()))
+
+	raw, err := reg.execAction(context.Background(), mustMarshal(map[string]any{"cmd": "echo hi"}))
+	if err != nil {
+		t.Fatalf("execAction: %v", err)
+	}
+	var got struct {
+		Stdout   string `json:"stdout"`
+		WorkDir  string `json:"work_dir"`
+		Fallback bool   `json:"work_dir_fallback"`
+		Default  string `json:"work_dir_default"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Fallback {
+		t.Fatalf("expected work_dir_fallback=true, got %s", raw)
+	}
+	if got.WorkDir != dir {
+		t.Fatalf("work_dir = %q, want %q", got.WorkDir, dir)
+	}
+	if got.Default != cfg.TomcatHome {
+		t.Fatalf("work_dir_default = %q, want %q", got.Default, cfg.TomcatHome)
+	}
+	if !strings.Contains(got.Stdout, "hi") {
+		t.Fatalf("stdout missing 'hi': %q", got.Stdout)
+	}
+}
+
+// TestExecAction_PowerShellShellExecutes is the end-to-end G3 check:
+// exec with shell=powershell must actually run the command (not echo it)
+// and land in work_dir.
+func TestExecAction_PowerShellShellExecutes(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("powershell wrapper is Windows-targeted")
+	}
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, execshell.NewExecutor(cfg).WithRunner(execshell.NewOSRunner()))
+	raw, err := reg.execAction(context.Background(), mustMarshal(map[string]any{
+		"cmd":   `Write-Output "hello world"; (Get-Location).Path`,
+		"shell": "powershell",
+	}))
+	if err != nil {
+		t.Fatalf("execAction: %v", err)
+	}
+	var got struct {
+		Stdout   string `json:"stdout"`
+		ExitCode int    `json:"exit_code"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ExitCode != 0 || !strings.Contains(got.Stdout, "hello world") {
+		t.Fatalf("powershell did not execute: exit=%d stdout=%q", got.ExitCode, got.Stdout)
+	}
+	if !strings.Contains(strings.ToLower(got.Stdout), strings.ToLower(cfg.TomcatHome)) {
+		t.Fatalf("Set-Location prologue missing? stdout=%q want %q", got.Stdout, cfg.TomcatHome)
+	}
+}
+
+// TestExecAction_ExplicitWorkDirStillRejected makes sure the fallback
+// only applies to the implicit default: an explicit work_dir outside
+// allowed_dirs keeps failing.
+func TestExecAction_ExplicitWorkDirStillRejected(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	_, err := reg.execAction(context.Background(), mustMarshal(map[string]any{
+		"cmd":      "echo hi",
+		"work_dir": filepath.FromSlash("/etc"),
+	}))
+	if err == nil {
+		t.Fatal("expected error for explicit work_dir outside allowed_dirs")
+	}
+	if !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("error should mention 'not allowed', got %v", err)
 	}
 }
 

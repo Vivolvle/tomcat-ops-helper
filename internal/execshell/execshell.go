@@ -76,6 +76,13 @@ func IsBlacklisted(cmd string) (string, bool) {
 // using a coarse heuristic suitable for guard-rail checks. It is intentionally
 // conservative (may under-report) rather than permissive.
 //
+// Quoting is respected: "D:\Program Files\MySQL\bin\mysqld.exe" is one
+// path, not two. The pre-2026-09-15 tokenizer split on every space and
+// rejected such commands with "path not allowed: D:\Program" (todo G2).
+// A quoted segment that itself contains a command (e.g.
+// cmd /C "rmdir /S /Q E:\foo") is still scanned word-by-word so embedded
+// paths are not missed.
+//
 // A token is treated as a path when it matches one of:
 //
 //   - drive-letter absolute path: `C:\...` or `C:/...`
@@ -84,19 +91,98 @@ func IsBlacklisted(cmd string) (string, bool) {
 //     (a single-segment `/S` is a cmd.exe switch, not a path)
 func ExtractPaths(cmd string) []string {
 	out := []string{}
-	tokens := strings.FieldsFunc(cmd, func(r rune) bool {
-		return r == ' ' || r == '\t' || r == ';' || r == '&' || r == '|' || r == '>' || r == '<'
-	})
-	for _, tok := range tokens {
-		tok = strings.Trim(tok, `"'`)
-		if tok == "" {
-			continue
+	seen := map[string]bool{}
+	add := func(tok string) {
+		tok = strings.TrimSpace(strings.Trim(tok, `"'`))
+		if tok == "" || !looksLikePath(tok) {
+			return
 		}
-		if looksLikePath(tok) {
-			out = append(out, filepath.Clean(tok))
+		p := filepath.Clean(tok)
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
 		}
 	}
+	for _, seg := range quotedSegments(cmd) {
+		if looksLikePath(strings.TrimSpace(seg)) {
+			add(seg)
+			continue
+		}
+		for _, tok := range splitTokens(seg) {
+			add(tok)
+		}
+	}
+	for _, tok := range splitTokens(blankQuoted(cmd)) {
+		add(tok)
+	}
 	return out
+}
+
+// CheckAllowedPaths returns ErrWorkDirNotAllowed when cmd mentions an
+// absolute path outside cfg.AllowedDirs. Exposed for callers that
+// transform the command before execution (e.g. the encoded PowerShell
+// wrapper in the actions layer) so the guard rail still runs against the
+// original, human-readable text.
+func CheckAllowedPaths(cfg *config.HelperConfig, cmd string) error {
+	for _, p := range ExtractPaths(cmd) {
+		if !cfg.IsAllowedWorkDir(p) {
+			return fmt.Errorf("%w: %s", ErrWorkDirNotAllowed, p)
+		}
+	}
+	return nil
+}
+
+// quotedSegments returns the contents of every "..." pair, in order.
+// Unterminated quotes are ignored (cmd.exe would reject them anyway).
+func quotedSegments(s string) []string {
+	var out []string
+	for {
+		i := strings.IndexByte(s, '"')
+		if i < 0 {
+			return out
+		}
+		rest := s[i+1:]
+		j := strings.IndexByte(rest, '"')
+		if j < 0 {
+			return out
+		}
+		out = append(out, rest[:j])
+		s = rest[j+1:]
+	}
+}
+
+// blankQuoted replaces every quoted segment (quotes included) with
+// spaces, so the unquoted pass never re-scans words the quoted pass
+// already handled.
+func blankQuoted(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			inQuote = !inQuote
+			b.WriteByte(' ')
+			continue
+		}
+		if inQuote {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// splitTokens splits on whitespace and cmd.exe separators.
+func splitTokens(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\r', '\n', ';', '&', '|', '>', '<':
+			return true
+		}
+		return false
+	})
 }
 
 // looksLikePath applies the rules described on ExtractPaths.
@@ -166,13 +252,11 @@ func (e *Executor) Exec(ctx context.Context, cmd, workDir string) (Result, error
 	}
 	if !e.cfg.IsAllowedWorkDir(workDir) {
 		e.audit(cmd, workDir, Result{ExitCode: -1}, 0, "work dir not allowed: "+workDir)
-		return Result{}, ErrWorkDirNotAllowed
+		return Result{}, fmt.Errorf("%w: %s", ErrWorkDirNotAllowed, workDir)
 	}
-	for _, p := range ExtractPaths(cmd) {
-		if !e.cfg.IsAllowedWorkDir(p) {
-			e.audit(cmd, workDir, Result{ExitCode: -1}, 0, "path not allowed: "+p)
-			return Result{}, fmt.Errorf("%w: %s", ErrWorkDirNotAllowed, p)
-		}
+	if err := CheckAllowedPaths(e.cfg, cmd); err != nil {
+		e.audit(cmd, workDir, Result{ExitCode: -1}, 0, err.Error())
+		return Result{}, err
 	}
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, e.cfg.CommandTimeout)

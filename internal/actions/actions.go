@@ -7,12 +7,15 @@ package actions
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"tomcat-ops-helper/internal/config"
 	"tomcat-ops-helper/internal/dbop"
@@ -125,20 +128,23 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 	if err != nil {
 		return nil, fmt.Errorf("exec: %w", err)
 	}
-	workDir, _ := p["work_dir"].(string)
-	if workDir == "" {
-		workDir = r.cfg.TomcatHome
-	}
+	explicitWorkDir, _ := p["work_dir"].(string)
+	workDir, fallbackFrom := r.resolveWorkDir(explicitWorkDir)
 
 	// Optional shell override. By default we go through cmd /C on Windows
 	// (or sh -c on Unix), which is fine for simple pipelines. When the
-	// user passes paths with spaces, or wants PowerShell-specific syntax
-	// (cmdlets, -EncodedCommand, etc.), "shell": "powershell" wraps the
-	// command in `powershell -NoProfile -NonInteractive -Command` with a
-	// `Set-Location` prologue so the work_dir still applies.
+	// caller wants PowerShell-specific syntax (cmdlets, etc.),
+	// "shell": "powershell" wraps the command in an encoded PowerShell
+	// script with a `Set-Location` prologue so the work_dir still applies.
 	if s, _ := p["shell"].(string); s != "" {
 		switch strings.ToLower(s) {
 		case "powershell", "pwsh":
+			// The wrapper base64-encodes the command, so Executor.Exec's
+			// path scan can no longer see the paths inside it. Run the
+			// guard rail on the original text before wrapping.
+			if err := execshell.CheckAllowedPaths(r.cfg, cmdStr); err != nil {
+				return nil, fmt.Errorf("exec: %w", err)
+			}
 			cmdStr = powershellWrap(cmdStr, workDir)
 		case "cmd":
 			// explicit "cmd" = no-op; default already is cmd on Windows.
@@ -150,34 +156,82 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 	}
 
 	out, err := r.executor.Exec(ctx, cmdStr, workDir)
-	data := mustMarshal(map[string]any{
+	fields := map[string]any{
 		"stdout":    out.Stdout,
 		"stderr":    out.Stderr,
 		"exit_code": out.ExitCode,
 		"took_ms":   out.Took.Milliseconds(),
 		"truncated": out.Truncated,
-	})
+		"work_dir":  workDir,
+	}
+	if fallbackFrom != "" {
+		// Surface the substitution so the caller knows why commands are
+		// running somewhere other than cfg.tomcat_home (todo G1②).
+		fields["work_dir_fallback"] = true
+		fields["work_dir_default"] = fallbackFrom
+	}
+	data := mustMarshal(fields)
 	if err != nil {
 		return data, err
 	}
 	return data, nil
 }
 
-// powershellWrap emits a single PowerShell -Command string that changes to
-// workDir then runs cmdStr. Both go through Go's `strings.Replace` so any
-// embedded single-quote in cmdStr gets doubled (PowerShell's escape rule).
+// resolveWorkDir picks the working directory for exec. An explicit
+// work_dir is passed through untouched (Executor validates it). When the
+// caller omits it, cfg.tomcat_home is used — but only if it exists and
+// is inside allowed_dirs. Otherwise the first existing allowed_dirs entry
+// is used, so a stale tomcat_home cannot wedge every exec call with
+// "work dir not allowed" (2026-09-15 G1②). fallbackFrom is non-empty when
+// the configured default was unusable and carries the value it replaced.
+func (r *Registry) resolveWorkDir(explicit string) (workDir, fallbackFrom string) {
+	if strings.TrimSpace(explicit) != "" {
+		return explicit, ""
+	}
+	def := r.cfg.TomcatHome
+	if r.cfg.IsAllowedWorkDir(def) && dirExists(def) {
+		return def, ""
+	}
+	for _, d := range r.cfg.AllowedDirs {
+		if dirExists(d) {
+			return d, def
+		}
+	}
+	if len(r.cfg.AllowedDirs) > 0 {
+		return r.cfg.AllowedDirs[0], def
+	}
+	return def, ""
+}
+
+func dirExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
+// powershellWrap turns cmdStr into `powershell -EncodedCommand <base64>`,
+// where the script is `Set-Location -LiteralPath '<workDir>'; <cmdStr>`.
 //
-// We do NOT shell-quote workDir because the executor's IsAllowedWorkDir
-// already validated it's an absolute, allowed path — and PowerShell's
-// Set-Location accepts a path with spaces as long as it's the last token
-// of the unquoted argument. We still wrap the whole prefix in single
-// quotes as a defensive measure for the rare path containing a quote.
+// Encoding as UTF-16LE base64 (the format -EncodedCommand expects) is
+// deliberate: the 2026-09-15 customer-box report (todo G3) showed the old
+// plain-text `-Command "…"` wrapper being echoed back instead of executed,
+// because cmd.exe's quote handling ate the string. Base64 contains no
+// quotes and no cmd.exe metacharacters, so nothing can mangle it.
 func powershellWrap(cmdStr, workDir string) string {
-	// PowerShell -Command takes a single string. Outer single quotes,
-	// cmd body with ' → ''.
-	escaped := strings.ReplaceAll(cmdStr, "'", "''")
-	return "powershell -NoProfile -NonInteractive -Command \"Set-Location -LiteralPath '" +
-		workDir + "'; " + escaped + "\""
+	script := "Set-Location -LiteralPath '" +
+		strings.ReplaceAll(workDir, "'", "''") + "'; " + cmdStr
+	return "powershell -NoProfile -NonInteractive -EncodedCommand " +
+		base64.StdEncoding.EncodeToString(utf16LEBytes(script))
+}
+
+// utf16LEBytes encodes s as UTF-16LE, the byte order PowerShell's
+// -EncodedCommand expects.
+func utf16LEBytes(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	buf := make([]byte, 0, len(units)*2)
+	for _, u := range units {
+		buf = append(buf, byte(u), byte(u>>8))
+	}
+	return buf
 }
 
 // dbOperator runs a SQL script against the connector registered for
