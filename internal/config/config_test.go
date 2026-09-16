@@ -203,6 +203,63 @@ func TestLoadHelper_DBConfig_NotConfiguredIsFine(t *testing.T) {
 	}
 }
 
+// TestLoadHelper_DBConfig_Enabled covers the three states of the
+// enabled flag: unset (default true), explicit true, explicit false.
+// The field is a *bool so an absent key and "false" are distinguishable
+// in code but collapse to the same end-user intent.
+func TestLoadHelper_DBConfig_Enabled(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		enabled bool
+	}{
+		{
+			name: "unset defaults to true",
+			body: `{
+				"server_url":"wss://x","token":"longenough",
+				"tomcat_home":"C:\\t","jdk_home":"C:\\j","log_dir":"C:\\t\\l","allowed_dirs":["C:\\t"],
+				"esb":{"host":"db","user":"u","password":"p","database":"d"}
+			}`,
+			enabled: true,
+		},
+		{
+			name: "explicit true",
+			body: `{
+				"server_url":"wss://x","token":"longenough",
+				"tomcat_home":"C:\\t","jdk_home":"C:\\j","log_dir":"C:\\t\\l","allowed_dirs":["C:\\t"],
+				"esb":{"host":"db","user":"u","password":"p","database":"d","enabled":true}
+			}`,
+			enabled: true,
+		},
+		{
+			name: "explicit false",
+			body: `{
+				"server_url":"wss://x","token":"longenough",
+				"tomcat_home":"C:\\t","jdk_home":"C:\\j","log_dir":"C:\\t\\l","allowed_dirs":["C:\\t"],
+				"erp":{"type":"oracle","host":"db","user":"u","password":"p","database":"d","enabled":false}
+			}`,
+			enabled: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadHelper(writeTempConfig(t, tc.body))
+			if err != nil {
+				t.Fatalf("LoadHelper: %v", err)
+			}
+			var got bool
+			if cfg.ESB != nil {
+				got = cfg.ESB.IsEnabled()
+			} else {
+				got = cfg.ERP.IsEnabled()
+			}
+			if got != tc.enabled {
+				t.Fatalf("IsEnabled=%v, want %v", got, tc.enabled)
+			}
+		})
+	}
+}
+
 // TestLoadHelper_SetsLoadedAt covers the "did helper pick up my edit?"
 // check exposed via status.config_loaded_at and validate_config.
 // Without this stamp, an LLM can only guess why a config change didn't

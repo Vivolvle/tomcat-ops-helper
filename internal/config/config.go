@@ -60,6 +60,21 @@ type DBConfig struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
 	Database string `json:"database"`
+	// Enabled is a pointer so we can distinguish "unset" (default true)
+	// from an explicit false. JSON omitempty drops it when nil so the
+	// field never appears in output unless the operator set it.
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// IsEnabled reports whether the corresponding dbop tool should be
+// registered. nil means "use default" → true. Set Enabled to false in
+// config.json to suppress the tool entirely (the block still gets
+// parsed, so reconnect / audit paths can still reference it).
+func (c *DBConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // Driver returns the lowercase driver name. Used by the dbop package to

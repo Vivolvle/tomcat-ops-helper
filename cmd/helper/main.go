@@ -84,11 +84,21 @@ func main() {
 	// primary purpose (Tomcat / log / exec) even when the DB is
 	// unreachable. The corresponding tool simply does not show up in
 	// Tools() and dispatching it returns a clear "not configured".
+	// An esb/erp block with enabled:false is parsed but skipped here,
+	// so the matching dbop tool does not get registered at all.
 	if cfg.ESB != nil {
-		wireDB(ctx, logger, registry, "esb_db_operator", cfg.ESB)
+		if cfg.ESB.IsEnabled() {
+			wireDB(ctx, logger, registry, "esb_db_operator", cfg.ESB)
+		} else {
+			logger.Printf("info: esb_db_operator disabled by config (esb.enabled=false); tool will not be registered")
+		}
 	}
 	if cfg.ERP != nil {
-		wireDB(ctx, logger, registry, "erp_db_operator", cfg.ERP)
+		if cfg.ERP.IsEnabled() {
+			wireDB(ctx, logger, registry, "erp_db_operator", cfg.ERP)
+		} else {
+			logger.Printf("info: erp_db_operator disabled by config (erp.enabled=false); tool will not be registered")
+		}
 	}
 
 	// Handle Ctrl+C / task-manager kill: stop the client cleanly.
