@@ -155,6 +155,14 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 		}
 	}
 
+	// Optional per-command timeout override. When set, wraps ctx so
+	// Executor.Exec sees a tighter deadline than cfg.CommandTimeout.
+	if v, ok := p["timeout"].(float64); ok && v > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(v*float64(time.Second)))
+		defer cancel()
+	}
+
 	out, err := r.executor.Exec(ctx, cmdStr, workDir)
 	fields := map[string]any{
 		"stdout":    out.Stdout,

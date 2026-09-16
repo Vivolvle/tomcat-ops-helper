@@ -51,7 +51,7 @@ type AuditEntry struct {
 var blacklist = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\brm\s+-rf\s+/`),
 	regexp.MustCompile(`(?i)\bformat\b`),
-	regexp.MustCompile(`(?i)\bshutdown\b`),
+	regexp.MustCompile(`(?i)\bshutdown(\.exe)?\s+(/[a-zA-Z]|\-[a-zA-Z])`),
 	regexp.MustCompile(`(?i)\bcurl\b[^\n|]*\|\s*bash\b`),
 	regexp.MustCompile(`(?i)\bwget\b[^\n|]*\|\s*bash\b`),
 	regexp.MustCompile(`(?i)\bdel\s+/f\s+/s\s+/q\s+([a-zA-Z]:\\|\\)`),
@@ -313,9 +313,15 @@ func truncateMiddle(s string, head, tail, original int) string {
 // splitCommand picks the platform-correct shell and tokenises cmd. We avoid
 // pulling in shell-specific parsing rules; this is a deliberate subset that
 // covers the typical needs (cd <dir> && <tool> <args>).
+//
+// On Windows, cmd.exe defaults to the system locale codepage (GBK on Chinese
+// systems). Prefixing with "chcp 65001 >nul &&" switches the console to
+// UTF-8 so Chinese output is not garbled. This is a no-op when the caller
+// already uses PowerShell (which defaults to UTF-8).
 func splitCommand(cmd string) (string, []string) {
 	if runtime.GOOS == "windows" {
-		return "cmd", []string{"/C", cmd}
+		// chcp 65001 switches cmd.exe to UTF-8 output.
+		return "cmd", []string{"/C", "chcp 65001 >nul && " + cmd}
 	}
 	return "sh", []string{"-c", cmd}
 }

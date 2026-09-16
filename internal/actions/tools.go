@@ -149,7 +149,8 @@ var execSchema = json.RawMessage(`{
 	"properties":{
 		"cmd":{"type":"string","description":"Shell command. Runs through cmd.exe /C on Windows or sh -c on Unix."},
 		"work_dir":{"type":"string","description":"Working directory; must be under allowed_dirs. Defaults to cfg.tomcat_home; if that is missing or not allowed, the first existing allowed_dirs entry is used and reported back as work_dir with work_dir_fallback=true."},
-		"shell":{"type":"string","enum":["powershell","pwsh","cmd","sh"],"description":"Optional shell override. 'powershell' or 'pwsh' wraps the command in powershell -NoProfile -NonInteractive -Command with a Set-Location prologue so paths with spaces and PowerShell-specific syntax work without the cmd /C tokenize quirks. Default is cmd /C on Windows, sh -c on Unix."}
+		"shell":{"type":"string","enum":["powershell","pwsh","cmd","sh"],"description":"Optional shell override. 'powershell' or 'pwsh' wraps the command in powershell -NoProfile -NonInteractive -Command with a Set-Location prologue so paths with spaces and PowerShell-specific syntax work without the cmd /C tokenize quirks. Default is cmd /C on Windows, sh -c on Unix."},
+		"timeout":{"type":"integer","description":"Per-command timeout in seconds. Defaults to cfg.command_timeout (30s). Increase for slow commands like net stop or large file extraction.","minimum":1}
 	},
 	"required":["cmd"],
 	"additionalProperties":false

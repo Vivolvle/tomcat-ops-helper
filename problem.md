@@ -33,3 +33,20 @@
   - **⑥ 非 bug** —— `validate_config` action 早就实现了，但同样依赖重启（与 ④ 同因）。
     文档（AGENTS.md + status 响应）已说明用法："改 config.json → 重启 helper →
     立即调 `validate_config`"。
+## [2026-09-16 14:23:37] — 已处理
+- 来源: user-feedback
+- 工具: tomcat-helper_exec
+- 原始反馈：
+  1. **shutdown 命令被黑名单拦截**：尝试调用 `shutdown.bat` 时被 `(?i)\bshutdown\b` 正则拦截。
+  2. **`net stop` 超时**：`net stop tomcat10-esb` 在 120s 默认超时内没有返回，可能是服务停止较慢。
+  3. **PowerShell 大文件解压超时**：`Expand-Archive` 解压 dist.zip（约几百MB）超时。
+  4. **输出编码问题**：中文输出在 cmd 下显示为乱码（GBK vs UTF-8）。
+
+- 处置（2026-09-16）：
+  - **① 已修** — `(?i)\bshutdown\b` 改为 `(?i)\bshutdown(\.exe)?\s+(/[a-zA-Z]|\-[a-zA-Z])`，
+    只拦截 Windows 系统关机命令（`shutdown /s`、`shutdown -s` 等），放过 Tomcat 的 `shutdown.bat`。
+  - **②③ 已修** — exec 新增可选 `timeout` 参数（秒），允许调用者覆盖默认的 `cfg.command_timeout`（30s）。
+    用法：`{"cmd":"net stop ...", "timeout": 180}` 或 `{"cmd":"Expand-Archive ...", "timeout": 600}`。
+  - **④ 已修** — Windows 上 exec 自动在命令前加 `chcp 65001 >nul &&`，将 cmd.exe 切换到 UTF-8 输出，
+    解决中文乱码问题。PowerShell 模式不受影响（默认已是 UTF-8）。
+

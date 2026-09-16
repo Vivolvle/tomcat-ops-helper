@@ -219,7 +219,7 @@ func TestExec_RejectsEmpty(t *testing.T) {
 func TestExec_OK(t *testing.T) {
 	cfg := mustConfig(t)
 	fr := newFakeRunner()
-	fr.set("cmd /C ls -la", Result{Stdout: "ok", ExitCode: 0})
+	fr.set("cmd /C chcp 65001 >nul && ls -la", Result{Stdout: "ok", ExitCode: 0})
 	var audited []AuditEntry
 	exec := NewExecutor(cfg).
 		WithRunner(fr).
@@ -244,7 +244,7 @@ func TestExec_TruncatesLargeOutput(t *testing.T) {
 	cfg := mustConfig(t)
 	fr := newFakeRunner()
 	big := strings.Repeat("A", 4096)
-	fr.set("cmd /C huge", Result{Stdout: big, ExitCode: 0})
+	fr.set("cmd /C chcp 65001 >nul && huge", Result{Stdout: big, ExitCode: 0})
 	exec := NewExecutor(cfg).WithRunner(fr)
 	res, err := exec.Exec(context.Background(), "huge", cfg.AllowedDirs[0])
 	if err != nil {
@@ -261,7 +261,7 @@ func TestExec_TruncatesLargeOutput(t *testing.T) {
 func TestExec_Timeout(t *testing.T) {
 	cfg := mustConfig(t)
 	fr := newFakeRunner()
-	fr.set("cmd /C slow", Result{Stdout: "", ExitCode: 0})
+	fr.set("cmd /C chcp 65001 >nul && slow", Result{Stdout: "", ExitCode: 0})
 	fr.delay = 5 * time.Second
 	exec := NewExecutor(cfg).WithRunner(fr)
 	start := time.Now()
