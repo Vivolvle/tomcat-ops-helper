@@ -21,13 +21,13 @@ import (
 
 // StatusData is the JSON returned by the "status" action.
 type StatusData struct {
-	Hostname    string        `json:"hostname"`
-	OS          string        `json:"os"`
-	Now         time.Time     `json:"now"`
-	TomcatHome  string        `json:"tomcat_home"`
-	TomcatExists bool         `json:"tomcat_exists"`
-	JavaProcs   []JavaProcess `json:"java_processes"`
-	Ports       []Port        `json:"listening_ports"`
+	Hostname     string        `json:"hostname"`
+	OS           string        `json:"os"`
+	Now          time.Time     `json:"now"`
+	TomcatHome   string        `json:"tomcat_home"`
+	TomcatExists bool          `json:"tomcat_exists"`
+	JavaProcs    []JavaProcess `json:"java_processes"`
+	Ports        []Port        `json:"listening_ports"`
 	// ConfigLoadedAt is when helper last read config.json. Compare against
 	// the file's mtime on disk: a mismatch means config.json was edited
 	// after startup and a restart is required for changes to take effect
@@ -156,8 +156,10 @@ func (r *Registry) tail(params json.RawMessage) (json.RawMessage, error) {
 
 // RestartData is the JSON returned by "restart".
 type RestartData struct {
-	Shutdown execshell.Result `json:"shutdown"`
-	Startup  execshell.Result `json:"startup"`
+	Mode        string           `json:"mode"`
+	ServiceName string           `json:"service_name,omitempty"`
+	Shutdown    execshell.Result `json:"shutdown"`
+	Startup     execshell.Result `json:"startup"`
 }
 
 func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -168,6 +170,15 @@ func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.Ra
 	timeout := r.cfg.CommandTimeout
 	if v, ok := p["timeout"].(float64); ok && v > 0 {
 		timeout = time.Duration(v * float64(time.Second))
+	}
+	if runtime.GOOS == "windows" {
+		serviceName := r.discoverWindowsServiceName(ctx)
+		if data, handled, err := r.restartWindowsService(ctx, serviceName, timeout); handled {
+			if err != nil {
+				return nil, err
+			}
+			return mustMarshal(data), nil
+		}
 	}
 	bin := filepath.Join(r.cfg.TomcatHome, "bin")
 	if runtime.GOOS == "windows" {
@@ -200,7 +211,100 @@ func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.Ra
 	defer upCancel()
 	startup, _ := r.executor.Exec(upCtx, binQuote(up, runtime.GOOS), workDir)
 
-	return mustMarshal(RestartData{Shutdown: shutdown, Startup: startup}), nil
+	return mustMarshal(RestartData{Mode: "scripts", Shutdown: shutdown, Startup: startup}), nil
+}
+
+// discoverWindowsServiceName prefers the configured name, then looks through
+// SCM entries for a service whose binary path references this Tomcat home.
+// This covers names such as "tomcat10-esb" that cannot be inferred from the
+// HTTP connector port. The server.xml-derived name remains a final fallback.
+func (r *Registry) discoverWindowsServiceName(ctx context.Context) string {
+	if r.cfg.ServiceName != "" {
+		return r.cfg.ServiceName
+	}
+	listing, err := r.executor.Exec(ctx, "sc query type= service state= all", r.cfg.TomcatHome)
+	if err == nil && listing.ExitCode == 0 {
+		re := regexp.MustCompile(`(?im)^SERVICE_NAME:\s*(\S+)\s*$`)
+		want := strings.ToLower(filepath.Clean(r.cfg.TomcatHome))
+		for _, match := range re.FindAllStringSubmatch(listing.Stdout, -1) {
+			name := match[1]
+			qc, qcErr := r.executor.Exec(ctx, fmt.Sprintf("sc qc %q", name), r.cfg.TomcatHome)
+			if qcErr != nil || qc.ExitCode != 0 {
+				continue
+			}
+			text := strings.ToLower(qc.Stdout + "\n" + qc.Stderr)
+			if strings.Contains(text, want) && (strings.Contains(text, "//rs//") || strings.Contains(text, "tomcat")) {
+				return name
+			}
+		}
+	}
+	return resolveServiceName(r.cfg.TomcatHome, "")
+}
+
+// restartWindowsService uses SCM for Tomcat installations registered through
+// Apache Commons Daemon/procrun. Running shutdown.bat against such an install
+// can exit 0 without stopping the service (and may even use a different JRE).
+func (r *Registry) restartWindowsService(ctx context.Context, serviceName string, timeout time.Duration) (RestartData, bool, error) {
+	workDir := r.cfg.TomcatHome
+	qc, err := r.executor.Exec(ctx, fmt.Sprintf("sc qc %q", serviceName), workDir)
+	if err != nil || qc.ExitCode != 0 {
+		return RestartData{}, false, nil // not registered: retain script fallback
+	}
+	qcText := strings.ToLower(qc.Stdout + "\n" + qc.Stderr)
+	if !strings.Contains(qcText, "//rs//") && !strings.Contains(qcText, "tomcat") {
+		return RestartData{}, false, nil
+	}
+
+	data := RestartData{Mode: "windows_service", ServiceName: serviceName}
+	stopCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	data.Shutdown, err = r.executor.Exec(stopCtx, fmt.Sprintf("sc stop %q", serviceName), workDir)
+	if err != nil || (data.Shutdown.ExitCode != 0 && !strings.Contains(strings.ToLower(data.Shutdown.Stdout+data.Shutdown.Stderr), "1062")) {
+		return data, true, fmt.Errorf("restart: service %s did not accept stop; use sc stop %s manually: %s", serviceName, serviceName, resultMessage(data.Shutdown, err))
+	}
+	if err := r.waitServiceState(stopCtx, serviceName, "STOPPED"); err != nil {
+		return data, true, fmt.Errorf("restart: service %s was not stopped within %s; consider taskkill /F /PID after checking sc queryex %s: %w", serviceName, timeout, serviceName, err)
+	}
+
+	startCtx, startCancel := context.WithTimeout(ctx, timeout)
+	defer startCancel()
+	data.Startup, err = r.executor.Exec(startCtx, fmt.Sprintf("sc start %q", serviceName), workDir)
+	if err != nil || data.Startup.ExitCode != 0 {
+		return data, true, fmt.Errorf("restart: service %s failed to start: %s", serviceName, resultMessage(data.Startup, err))
+	}
+	if err := r.waitServiceState(startCtx, serviceName, "RUNNING"); err != nil {
+		return data, true, fmt.Errorf("restart: service %s did not reach RUNNING within %s: %w", serviceName, timeout, err)
+	}
+	return data, true, nil
+}
+
+func (r *Registry) waitServiceState(ctx context.Context, serviceName, wanted string) error {
+	for {
+		q, err := r.executor.Exec(ctx, fmt.Sprintf("sc query %q", serviceName), r.cfg.TomcatHome)
+		if err != nil {
+			return err
+		}
+		text := strings.ToUpper(q.Stdout + "\n" + q.Stderr)
+		if q.ExitCode == 0 && strings.Contains(text, wanted) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func resultMessage(res execshell.Result, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	msg := strings.TrimSpace(res.Stderr)
+	if msg == "" {
+		msg = strings.TrimSpace(res.Stdout)
+	}
+	return fmt.Sprintf("exit_code=%d %s", res.ExitCode, msg)
 }
 
 // binQuote wraps a script path with quotes suitable for the platform shell.
@@ -216,11 +320,11 @@ func binQuote(p string, goos string) string {
 
 // ReplaceJarData is the JSON returned by "replace_jar".
 type ReplaceJarData struct {
-	Source     string `json:"source"`
-	Dest       string `json:"dest"`
-	SHA256     string `json:"sha256"`
-	Bytes      int64  `json:"bytes"`
-	Restarted  bool   `json:"restarted,omitempty"`
+	Source    string `json:"source"`
+	Dest      string `json:"dest"`
+	SHA256    string `json:"sha256"`
+	Bytes     int64  `json:"bytes"`
+	Restarted bool   `json:"restarted,omitempty"`
 }
 
 func (r *Registry) replaceJar(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -285,8 +389,8 @@ func (r *Registry) replaceJar(ctx context.Context, params json.RawMessage) (json
 
 // KillZombieData is the JSON returned by "kill_zombie".
 type KillZombieData struct {
-	Killed []int `json:"killed"`
-	Found  []int `json:"found"`
+	Killed []int    `json:"killed"`
+	Found  []int    `json:"found"`
 	Errors []string `json:"errors,omitempty"`
 }
 
@@ -336,14 +440,14 @@ type RegenServiceData struct {
 	Path           string `json:"path"`
 	Bytes          int    `json:"bytes"`
 	ServiceName    string `json:"service_name,omitempty"`
-	PrunsrvPath    string `json:"prunsrv_path,omitempty"`     // path to <ServiceName>.exe (prunsrv)
-	PrunsrvCopied  bool   `json:"prunsrv_copied"`             // true if tomcat9/tomcat10.exe was copied to <ServiceName>.exe
-	PrunsrvExisted bool   `json:"prunsrv_already_existed"`    // true if <ServiceName>.exe was already on disk
-	PrunsrvSource  string `json:"prunsrv_source,omitempty"`   // where the prunsrv copy was sourced from, if anything
-	MonitorPath    string `json:"monitor_path,omitempty"`      // path to <ServiceName>w.exe
-	MonitorCopied  bool   `json:"monitor_copied"`              // true if tomcat9w/tomcat10w.exe was copied to <ServiceName>w.exe
-	MonitorExisted bool   `json:"monitor_already_existed"`     // true if <ServiceName>w.exe was already on disk
-	MonitorSource  string `json:"monitor_source,omitempty"`    // where the monitor copy was sourced from, if anything
+	PrunsrvPath    string `json:"prunsrv_path,omitempty"`   // path to <ServiceName>.exe (prunsrv)
+	PrunsrvCopied  bool   `json:"prunsrv_copied"`           // true if tomcat9/tomcat10.exe was copied to <ServiceName>.exe
+	PrunsrvExisted bool   `json:"prunsrv_already_existed"`  // true if <ServiceName>.exe was already on disk
+	PrunsrvSource  string `json:"prunsrv_source,omitempty"` // where the prunsrv copy was sourced from, if anything
+	MonitorPath    string `json:"monitor_path,omitempty"`   // path to <ServiceName>w.exe
+	MonitorCopied  bool   `json:"monitor_copied"`           // true if tomcat9w/tomcat10w.exe was copied to <ServiceName>w.exe
+	MonitorExisted bool   `json:"monitor_already_existed"`  // true if <ServiceName>w.exe was already on disk
+	MonitorSource  string `json:"monitor_source,omitempty"` // where the monitor copy was sourced from, if anything
 	Content        string `json:"content,omitempty"`
 }
 
@@ -377,7 +481,7 @@ func resolveServiceName(tomcatHome, configured string) string {
 func resolvePrunsrvSource(bin string) (prunsrv, monitor string) {
 	for _, base := range []string{"tomcat10", "tomcat9"} {
 		if _, err := os.Stat(filepath.Join(bin, base+".exe")); err == nil {
-			return filepath.Join(bin, base + ".exe"), filepath.Join(bin, base + "w.exe")
+			return filepath.Join(bin, base+".exe"), filepath.Join(bin, base+"w.exe")
 		}
 	}
 	return "", ""
@@ -389,16 +493,16 @@ func (r *Registry) regenService(params json.RawMessage) (json.RawMessage, error)
 		return nil, errors.New("regen_service: bin dir not allowed")
 	}
 	var (
-		path, content string
-		serviceName   string
-		prunsrvPath   string
-		prunsrvCopied bool
+		path, content  string
+		serviceName    string
+		prunsrvPath    string
+		prunsrvCopied  bool
 		prunsrvExisted bool
-		prunsrvSrc    string
-		monitorPath   string
-		monitorCopied bool
+		prunsrvSrc     string
+		monitorPath    string
+		monitorCopied  bool
 		monitorExisted bool
-		monitorSrc    string
+		monitorSrc     string
 	)
 	if runtime.GOOS == "windows" {
 		serviceName = resolveServiceName(r.cfg.TomcatHome, r.cfg.ServiceName)
@@ -654,6 +758,54 @@ func (r *Registry) writeFile(params json.RawMessage) (json.RawMessage, error) {
 	}), nil
 }
 
+// appendTextFile appends UTF-8 text without a BOM and fsyncs it before
+// returning. It is intended for small scripts, notes and configuration
+// fragments where callers should not need base64 upload chunks.
+func (r *Registry) appendTextFile(params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, fmt.Errorf("append_text_file: %w", err)
+	}
+	path, err := requireString(p, "path")
+	if err != nil {
+		return nil, fmt.Errorf("append_text_file: %w", err)
+	}
+	text, ok := p["text"].(string)
+	if !ok {
+		return nil, fmt.Errorf("append_text_file: %w: text", ErrMissingField)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("append_text_file: path: %w", err)
+	}
+	if !r.cfg.IsAllowedWorkDir(abs) {
+		return nil, fmt.Errorf("append_text_file: path not in allowed dir: %s; allowed_dirs: %s", abs, strings.Join(r.cfg.AllowedDirs, ", "))
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return nil, fmt.Errorf("append_text_file: mkdir: %w", err)
+	}
+	f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("append_text_file: open: %w", err)
+	}
+	n, writeErr := f.WriteString(text)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		return nil, fmt.Errorf("append_text_file: write: %w", writeErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("append_text_file: close: %w", closeErr)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("append_text_file: stat: %w", err)
+	}
+	return mustMarshal(map[string]any{"path": abs, "bytes_appended": n, "total_bytes": info.Size()}), nil
+}
+
 // writeAtomic writes payload to tmp, fsyncs, then renames tmp over dst. On
 // any failure the tmp file is removed so we never leak a half-written file
 // alongside an untouched dst.
@@ -693,16 +845,16 @@ func writeAtomic(tmp, dst string, payload []byte, mode os.FileMode) error {
 // the credential, and Status.LastError tells you why a connector is
 // down without leaking anything.
 type ValidateData struct {
-	Now           time.Time                  `json:"now"`
-	ConfigLoadedAt time.Time                 `json:"config_loaded_at"`
-	TomcatHome    string                     `json:"tomcat_home"`
-	TomcatExists  bool                       `json:"tomcat_exists"`
-	JDKHome       string                     `json:"jdk_home"`
-	JDKExists     bool                       `json:"jdk_exists"`
-	LogDir        string                     `json:"log_dir"`
-	LogDirExists  bool                       `json:"log_dir_exists"`
-	AllowedDirs   []ValidateAllowedDir       `json:"allowed_dirs"`
-	Connectors    map[string]ValidateConnector `json:"connectors"`
+	Now            time.Time                    `json:"now"`
+	ConfigLoadedAt time.Time                    `json:"config_loaded_at"`
+	TomcatHome     string                       `json:"tomcat_home"`
+	TomcatExists   bool                         `json:"tomcat_exists"`
+	JDKHome        string                       `json:"jdk_home"`
+	JDKExists      bool                         `json:"jdk_exists"`
+	LogDir         string                       `json:"log_dir"`
+	LogDirExists   bool                         `json:"log_dir_exists"`
+	AllowedDirs    []ValidateAllowedDir         `json:"allowed_dirs"`
+	Connectors     map[string]ValidateConnector `json:"connectors"`
 }
 
 // ValidateAllowedDir is one entry of allowed_dirs with an existence check.

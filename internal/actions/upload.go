@@ -9,6 +9,7 @@ import (
 	"hash"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -23,13 +24,14 @@ const uploadChunkSize = 64 * 1024
 // Params (not the outer Envelope) so the wire format stays clean for
 // every other message type.
 type UploadParams struct {
-	Path           string `json:"path"`                  // absolute destination on the helper
-	UploadID       string `json:"upload_id"`             // session id; client-supplied
-	ChunkB64       string `json:"chunk,omitempty"`      // base64 of this chunk's bytes
-	ChunkOffset    int64  `json:"chunk_offset"`         // byte offset within the file
-	ChunkDone      bool   `json:"chunk_done"`           // true on last chunk
+	Path           string `json:"path"`            // absolute destination on the helper
+	UploadID       string `json:"upload_id"`       // session id; client-supplied
+	ChunkB64       string `json:"chunk,omitempty"` // base64 of this chunk's bytes
+	ChunkOffset    int64  `json:"chunk_offset"`    // byte offset within the file
+	ChunkDone      bool   `json:"chunk_done"`      // true on last chunk
 	ExpectedSHA256 string `json:"expected_sha256,omitempty"`
 	Overwrite      bool   `json:"overwrite,omitempty"`  // replace existing file (default false)
+	QueryOnly      bool   `json:"query_only,omitempty"` // report resumable offset without writing
 }
 
 // UploadProgressData is the Result data sent back for intermediate
@@ -37,7 +39,9 @@ type UploadParams struct {
 type UploadProgressData struct {
 	UploadID     string `json:"upload_id"`
 	BytesWritten int64  `json:"bytes_written"`
+	NextOffset   int64  `json:"next_offset"`
 	Accepted     bool   `json:"accepted"`
+	SessionFound bool   `json:"session_found"`
 }
 
 // UploadResultData is the Result data sent back on the final chunk.
@@ -46,8 +50,8 @@ type UploadResultData struct {
 	Path        string `json:"path"`
 	Bytes       int64  `json:"bytes"`
 	SHA256      string `json:"sha256"`
-	Verified    bool   `json:"verified"`     // true when expected_sha256 matched (or none was given)
-	Overwritten bool   `json:"overwritten"`  // true if a pre-existing file was replaced
+	Verified    bool   `json:"verified"`    // true when expected_sha256 matched (or none was given)
+	Overwritten bool   `json:"overwritten"` // true if a pre-existing file was replaced
 }
 
 // uploadSession tracks one in-flight upload. Fields are protected by
@@ -116,14 +120,13 @@ func (u *uploadRegistry) del(id string) {
 //
 // File lifecycle per upload:
 //
-//   1. chunk_offset=0 with a fresh upload_id   → open <path>.tmp
-//   2. subsequent chunks                       → append, fsync, hash
-//   3. chunk_done=true                         → close, verify sha256,
-//                                                atomic rename → final path
+//  1. chunk_offset=0 with a fresh upload_id   → open <path>.tmp
+//  2. subsequent chunks                       → append, fsync, hash
+//  3. chunk_done=true                         → close, verify sha256,
+//     atomic rename → final path
 //
-// On any error the .tmp is removed and the session is dropped. A
-// later chunk for the same upload_id will start a fresh session
-// (offset 0).
+// Offset and base64 validation errors preserve the session so callers can
+// retry. Errors that may leave file/hash state uncertain abort and remove it.
 func (r *Registry) uploadFile(params json.RawMessage) (json.RawMessage, error) {
 	var p UploadParams
 	if err := json.Unmarshal(params, &p); err != nil {
@@ -141,10 +144,21 @@ func (r *Registry) uploadFile(params json.RawMessage) (json.RawMessage, error) {
 		return nil, fmt.Errorf("upload_file: path: %w", err)
 	}
 	if !r.cfg.IsAllowedWorkDir(abs) {
-		return nil, fmt.Errorf("upload_file: path not in allowed dir: %s", abs)
+		return nil, fmt.Errorf("upload_file: path not in allowed dir: %s; place the file under one of allowed_dirs: %s", abs, strings.Join(r.cfg.AllowedDirs, ", "))
 	}
 
 	sess, exists := r.uploads.get(p.UploadID)
+	if p.QueryOnly {
+		if !exists {
+			return mustMarshal(UploadProgressData{UploadID: p.UploadID, SessionFound: false}), nil
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if sess.finalPath != abs {
+			return nil, fmt.Errorf("upload_file: upload_id=%s belongs to %s, not %s", p.UploadID, sess.finalPath, abs)
+		}
+		return mustMarshal(UploadProgressData{UploadID: p.UploadID, BytesWritten: sess.written, NextOffset: sess.written, SessionFound: true}), nil
+	}
 	if !exists {
 		// First chunk: validate metadata and open the session.
 		if p.ChunkOffset != 0 {
@@ -182,18 +196,15 @@ func (r *Registry) uploadFile(params json.RawMessage) (json.RawMessage, error) {
 	defer sess.mu.Unlock()
 
 	if p.ChunkOffset != sess.written {
-		// Misordered chunk; abort the whole upload so the caller can
-		// restart from offset 0 with a new upload_id.
-		r.uploads.del(p.UploadID)
+		// Preserve the session so callers can query/retry from expected.
 		return nil, fmt.Errorf(
-			"upload_file: chunk_offset=%d != expected=%d (aborted)",
+			"upload_file: chunk_offset=%d != expected=%d decoded file bytes; session preserved, retry at expected offset or use query_only=true",
 			p.ChunkOffset, sess.written)
 	}
 
 	raw, err := base64.StdEncoding.DecodeString(p.ChunkB64)
 	if err != nil {
-		r.uploads.del(p.UploadID)
-		return nil, fmt.Errorf("upload_file: chunk base64: %w", err)
+		return nil, fmt.Errorf("upload_file: chunk base64 at decoded-byte offset %d (session preserved; retry this chunk): %w", sess.written, err)
 	}
 	if _, err := sess.f.Write(raw); err != nil {
 		r.uploads.del(p.UploadID)
@@ -206,7 +217,9 @@ func (r *Registry) uploadFile(params json.RawMessage) (json.RawMessage, error) {
 		return mustMarshal(UploadProgressData{
 			UploadID:     p.UploadID,
 			BytesWritten: sess.written,
+			NextOffset:   sess.written,
 			Accepted:     true,
+			SessionFound: true,
 		}), nil
 	}
 

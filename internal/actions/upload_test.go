@@ -19,13 +19,13 @@ func uploadOnce(t *testing.T, reg *Registry, id, path string, offset int64, chun
 	t.Helper()
 	b64 := base64.StdEncoding.EncodeToString(chunk)
 	params := mustMarshal(map[string]any{
-		"path":             path,
-		"upload_id":        id,
-		"chunk":            b64,
-		"chunk_offset":     offset,
-		"chunk_done":       done,
-		"expected_sha256":  sha,
-		"overwrite":        overwrite,
+		"path":            path,
+		"upload_id":       id,
+		"chunk":           b64,
+		"chunk_offset":    offset,
+		"chunk_done":      done,
+		"expected_sha256": sha,
+		"overwrite":       overwrite,
 	})
 	raw, err := reg.uploadFile(params)
 	if err != nil {
@@ -105,7 +105,7 @@ func TestUploadFile_MultiChunk_AssemblesAndHashes(t *testing.T) {
 	}
 }
 
-func TestUploadFile_OffsetMismatch_Aborts(t *testing.T) {
+func TestUploadFile_OffsetMismatch_PreservesForResume(t *testing.T) {
 	cfg := mustCfg(t)
 	reg := NewRegistry(cfg, mustExec(t))
 	dst := filepath.Join(cfg.LogDir, "out.bin")
@@ -122,22 +122,28 @@ func TestUploadFile_OffsetMismatch_Aborts(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error on offset mismatch")
 	}
-	if !strings.Contains(err.Error(), "aborted") {
-		t.Fatalf("error = %v, want 'aborted' substring", err)
+	if !strings.Contains(err.Error(), "expected=3") || !strings.Contains(err.Error(), "session preserved") {
+		t.Fatalf("error = %v, want recoverable expected offset", err)
 	}
-	// .tmp should be gone and no final file.
+	// The partial file and session remain. Query returns the decoded-byte
+	// offset, then the caller can resume with that exact offset.
 	if _, err := os.Stat(dst); !os.IsNotExist(err) {
 		t.Fatalf("dst should not exist: %v", err)
 	}
-	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
-		t.Fatalf(".tmp should be removed: %v", err)
+	if _, err := os.Stat(dst + ".tmp"); err != nil {
+		t.Fatalf(".tmp should be preserved: %v", err)
 	}
-
-	// After abort, a fresh upload_id should succeed at offset 0.
-	body := []byte("fresh start")
-	_, fin := uploadOnce(t, reg, "u-mm-2", dst, 0, body, true, sha256Hex(body), false)
-	if fin.Bytes != int64(len(body)) {
-		t.Fatalf("bytes = %d, want %d", fin.Bytes, len(body))
+	raw, err := reg.uploadFile(mustMarshal(map[string]any{"path": dst, "upload_id": "u-mm", "query_only": true}))
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	var progress UploadProgressData
+	if err := json.Unmarshal(raw, &progress); err != nil || !progress.SessionFound || progress.NextOffset != 3 {
+		t.Fatalf("query progress = %+v, err=%v", progress, err)
+	}
+	_, fin := uploadOnce(t, reg, "u-mm", dst, 3, []byte("XYZ"), true, sha256Hex([]byte("ABCXYZ")), false)
+	if fin.Bytes != 6 {
+		t.Fatalf("bytes = %d, want 6", fin.Bytes)
 	}
 }
 
@@ -195,6 +201,9 @@ func TestUploadFile_RejectsDisallowedPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for disallowed path")
 	}
+	if !strings.Contains(err.Error(), "allowed_dirs") || !strings.Contains(err.Error(), cfg.AllowedDirs[0]) {
+		t.Fatalf("error should guide caller to allowed_dirs: %v", err)
+	}
 }
 
 func TestUploadFile_RequiresFields(t *testing.T) {
@@ -220,12 +229,12 @@ func TestUploadFile_SHA256Mismatch_DoesNotPromote(t *testing.T) {
 	wrongHash := sha256Hex([]byte("something else"))
 
 	_, err := reg.uploadFile(mustMarshal(map[string]any{
-		"path":             dst,
-		"upload_id":        "u-mis",
-		"chunk":            base64.StdEncoding.EncodeToString(body),
-		"chunk_offset":     0,
-		"chunk_done":       true,
-		"expected_sha256":  wrongHash,
+		"path":            dst,
+		"upload_id":       "u-mis",
+		"chunk":           base64.StdEncoding.EncodeToString(body),
+		"chunk_offset":    0,
+		"chunk_done":      true,
+		"expected_sha256": wrongHash,
 	}))
 	if err == nil {
 		t.Fatal("expected sha256 mismatch error")

@@ -128,8 +128,8 @@ func TestListLogs_OK(t *testing.T) {
 		t.Fatalf("listLogs: %v", err)
 	}
 	var got struct {
-		Dir   string     `json:"dir"`
-		Files []LogFile  `json:"files"`
+		Dir   string    `json:"dir"`
+		Files []LogFile `json:"files"`
 	}
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -185,6 +185,24 @@ func TestTail_RejectsDisallowedDir(t *testing.T) {
 	_, err := reg.tail(mustMarshal(map[string]any{"file": "C:\\Windows\\System32\\drivers\\etc\\hosts", "lines": float64(5)}))
 	if err == nil {
 		t.Fatal("expected error for disallowed dir")
+	}
+}
+
+func TestAppendTextFile_CreatesAndAppendsUTF8(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	path := filepath.Join(cfg.TomcatHome, "scripts", "说明.ps1")
+	for _, text := range []string{"第一行\n", "第二行\n"} {
+		if _, err := reg.appendTextFile(mustMarshal(map[string]any{"path": path, "text": text})); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got, want := string(body), "第一行\n第二行\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
 
@@ -627,7 +645,7 @@ func TestWriteFile_RequiresFields(t *testing.T) {
 	cfg := mustCfg(t)
 	reg := NewRegistry(cfg, mustExec(t))
 	cases := []map[string]any{
-		{"text": "x"},                                 // missing path
+		{"text": "x"}, // missing path
 		{"path": filepath.Join(cfg.LogDir, "no.txt")}, // missing text
 	}
 	for i, p := range cases {

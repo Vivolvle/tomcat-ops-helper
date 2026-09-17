@@ -106,6 +106,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.execAction(ctx, params)
 	case "write_file":
 		return r.writeFile(params)
+	case "append_text_file":
+		return r.appendTextFile(params)
 	case "upload_file":
 		return r.uploadFile(params)
 	case "validate_config":

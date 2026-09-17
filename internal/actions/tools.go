@@ -80,8 +80,13 @@ func coreTools() []Tool {
 			InputSchema: writeFileSchema,
 		},
 		{
+			Name:        "append_text_file",
+			Description: "Append UTF-8 text to a small file under allowed_dirs. Creates parent directories and the file when missing, writes no BOM, fsyncs before returning, and reports appended and total bytes.",
+			InputSchema: appendTextFileSchema,
+		},
+		{
 			Name:        "upload_file",
-			Description: "Append a chunk to an in-progress file upload. The caller sends many Commands with the same upload_id (offset 0, 64K, 128K, ...). The final chunk sets chunk_done=true. Path must be under allowed_dirs; overwrite=true is required to replace an existing file. Returns bytes_written per chunk and {path, bytes, sha256, verified} on the final chunk. Intended to be driven by server.exe's POST /upload, not directly by LLMs.",
+			Description: "Append a base64 chunk to an in-progress upload. chunk_offset is the decoded file-byte offset (not a base64 character offset). Set query_only=true to recover the next expected offset without sending data. Offset mistakes preserve the session and report the expected offset. Path must be under allowed_dirs; errors echo allowed_dirs. Prefer server.exe POST /upload for large files and write_file/append_text_file for text.",
 			InputSchema: uploadFileSchema,
 		},
 		{
@@ -167,6 +172,16 @@ var writeFileSchema = json.RawMessage(`{
 	"additionalProperties":false
 }`)
 
+var appendTextFileSchema = json.RawMessage(`{
+	"type":"object",
+	"properties":{
+		"path":{"type":"string","description":"Absolute destination path; its parent must be under allowed_dirs."},
+		"text":{"type":"string","description":"UTF-8 text appended exactly; no BOM or newline is added automatically."}
+	},
+	"required":["path","text"],
+	"additionalProperties":false
+}`)
+
 var uploadFileSchema = json.RawMessage(`{
 	"type":"object",
 	"properties":{
@@ -174,11 +189,12 @@ var uploadFileSchema = json.RawMessage(`{
 		"upload_id":{"type":"string","description":"Session id; same value for every chunk of one file. Use a fresh id per file."},
 		"chunk":{"type":"string","description":"Base64-encoded chunk bytes."},
 		"chunk_offset":{"type":"integer","description":"Byte offset of this chunk within the file (0 for the first chunk).","minimum":0},
+		"query_only":{"type":"boolean","description":"Return whether this upload_id exists and its next decoded-byte offset without writing a chunk."},
 		"chunk_done":{"type":"boolean","description":"True on the last chunk; helper will fsync, verify sha256, and atomically rename."},
 		"expected_sha256":{"type":"string","description":"Optional lowercase hex SHA-256 to verify against after the final chunk."},
 		"overwrite":{"type":"boolean","description":"Allow replacing an existing file. Default false."}
 	},
-	"required":["path","upload_id","chunk","chunk_offset","chunk_done"],
+	"required":["path","upload_id"],
 	"additionalProperties":false
 }`)
 
