@@ -13,20 +13,20 @@ import (
 
 // HelperConfig mirrors the config.json shipped next to helper.exe.
 type HelperConfig struct {
-	ServerURL         string        `json:"server_url"`
-	Token             string        `json:"token"`
-	ClientID          string        `json:"client_id,omitempty"`
-	TomcatHome        string        `json:"tomcat_home"`
-	JDKHome           string        `json:"jdk_home"`
-	LogDir            string        `json:"log_dir"`
-	AllowedDirs       []string      `json:"allowed_dirs"`
-	CommandTimeout    time.Duration `json:"command_timeout"`
-	MaxOutputSize     int64         `json:"max_output_size"`
-	ReconnectInterval time.Duration `json:"reconnect_interval"`
-	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
-	HeartbeatTimeout  time.Duration `json:"heartbeat_timeout"`
-	LogFile           string        `json:"log_file"`
-	InsecureSkipVerify bool         `json:"insecure_skip_verify"`
+	ServerURL          string        `json:"server_url"`
+	Token              string        `json:"token"`
+	ClientID           string        `json:"client_id,omitempty"`
+	TomcatHome         string        `json:"tomcat_home"`
+	JDKHome            string        `json:"jdk_home"`
+	LogDir             string        `json:"log_dir"`
+	AllowedDirs        []string      `json:"allowed_dirs"`
+	CommandTimeout     time.Duration `json:"command_timeout"`
+	MaxOutputSize      int64         `json:"max_output_size"`
+	ReconnectInterval  time.Duration `json:"reconnect_interval"`
+	HeartbeatInterval  time.Duration `json:"heartbeat_interval"`
+	HeartbeatTimeout   time.Duration `json:"heartbeat_timeout"`
+	LogFile            string        `json:"log_file"`
+	InsecureSkipVerify bool          `json:"insecure_skip_verify"`
 
 	// LoadedAt is when this HelperConfig was parsed from disk. Set by
 	// LoadHelper. Exposed (json:"-") so status / validate_config can
@@ -60,6 +60,11 @@ type DBConfig struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
 	Database string `json:"database"`
+	// SQL Server TLS compatibility knobs. Other drivers ignore these.
+	Encrypt        string `json:"encrypt,omitempty"`
+	TLSMin         string `json:"tls_min,omitempty"`
+	TrustCert      bool   `json:"trust_cert,omitempty"`
+	HostnameInCert string `json:"hostname_in_cert,omitempty"`
 	// Enabled is a pointer so we can distinguish "unset" (default true)
 	// from an explicit false. JSON omitempty drops it when nil so the
 	// field never appears in output unless the operator set it.

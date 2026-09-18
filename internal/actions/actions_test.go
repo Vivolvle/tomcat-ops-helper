@@ -761,7 +761,8 @@ func TestValidateConfig_WithConnectors(t *testing.T) {
 		}).
 		WithDB("erp_db_operator", &dbop.FakeOp{
 			Driver: "oracle", Host: "oh", Database: "ORCL",
-			Open: false, LastError: "ORA-01017: invalid username/password",
+			CurrentSchema: "BFDHERP",
+			Open:          false, LastError: "ORA-01017: invalid username/password",
 		})
 	raw, err := reg.validateConfig(context.Background())
 	if err != nil {
@@ -787,6 +788,9 @@ func TestValidateConfig_WithConnectors(t *testing.T) {
 	}
 	if erp.Open {
 		t.Fatal("erp Open should be false (FakeOp)")
+	}
+	if erp.CurrentSchema != "BFDHERP" {
+		t.Fatalf("erp CurrentSchema = %q, want BFDHERP", erp.CurrentSchema)
 	}
 	if !strings.Contains(erp.LastError, "ORA-01017") {
 		t.Fatalf("erp LastError should carry the ORA-01017 message, got %q", erp.LastError)

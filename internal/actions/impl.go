@@ -865,14 +865,15 @@ type ValidateAllowedDir struct {
 
 // ValidateConnector is the health snapshot of one DB connector.
 type ValidateConnector struct {
-	Configured bool   `json:"configured"`
-	Open       bool   `json:"open"`
-	Driver     string `json:"driver,omitempty"`
-	Host       string `json:"host,omitempty"`
-	Port       int    `json:"port,omitempty"`
-	Database   string `json:"database,omitempty"`
-	LatencyMs  int64  `json:"latency_ms,omitempty"`
-	LastError  string `json:"last_error,omitempty"`
+	Configured    bool   `json:"configured"`
+	Open          bool   `json:"open"`
+	Driver        string `json:"driver,omitempty"`
+	Host          string `json:"host,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	Database      string `json:"database,omitempty"`
+	CurrentSchema string `json:"current_schema,omitempty"`
+	LatencyMs     int64  `json:"latency_ms,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
 }
 
 func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) {
@@ -890,14 +891,15 @@ func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) 
 	for name, op := range r.dbops {
 		st := op.Status(ctx)
 		connectors[name] = ValidateConnector{
-			Configured: st.Configured,
-			Open:       st.Open,
-			Driver:     st.Driver,
-			Host:       st.Host,
-			Port:       st.Port,
-			Database:   st.Database,
-			LatencyMs:  st.LatencyMs,
-			LastError:  st.LastError,
+			Configured:    st.Configured,
+			Open:          st.Open,
+			Driver:        st.Driver,
+			Host:          st.Host,
+			Port:          st.Port,
+			Database:      st.Database,
+			CurrentSchema: st.CurrentSchema,
+			LatencyMs:     st.LatencyMs,
+			LastError:     st.LastError,
 		}
 	}
 

@@ -151,6 +151,10 @@ function instead of writing to disk.
 - Token in `config.json` **must match** a token in `server.json`'s `tokens[]`.
 - Helper logs go to stdout and to `helper.log` (audit). Server writes
   `audit.log` JSONL.
+- Database writes run in an explicit per-statement transaction. Do not put
+  `BEGIN` / `COMMIT` / `ROLLBACK` into dbop scripts. Read queries may retry
+  once after a stale connection; writes are deliberately never replayed
+  automatically because a lost commit response makes their outcome unknown.
 - Default helper.exe is built **with console** for visibility. For stealth,
   rebuild with `-ldflags="-H windowsgui -s -w"`. `run-helper.ps1` has the note.
 

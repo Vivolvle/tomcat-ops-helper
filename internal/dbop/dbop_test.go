@@ -121,24 +121,24 @@ func TestRouteStatement_SelectIsQuery(t *testing.T) {
 
 func TestRouteStatement_OtherKeywords(t *testing.T) {
 	cases := map[string]StatementKind{
-		"SHOW TABLES":                 KindQuery,
-		"DESC t":                      KindQuery,
-		"DESCRIBE t":                  KindQuery,
-		"EXPLAIN SELECT 1":            KindQuery,
-		"VALUES (1)":                  KindQuery,
-		"TABLE t":                     KindQuery, // standard SQL: TABLE x is shorthand for SELECT * FROM x
-		"(SELECT 1)":                  KindQuery, // parenthesised SELECT
-		"  (  SELECT 1 )":             KindQuery,
-		"UPDATE t SET x=1":            KindExec,
-		"INSERT INTO t VALUES (1)":    KindExec,
-		"DELETE FROM t":               KindExec,
-		"DROP TABLE t":                KindExec,
-		"CREATE TABLE t (id int)":     KindExec,
-		"TRUNCATE TABLE t":            KindExec,
-		"BEGIN":                       KindExec,
-		"COMMIT":                      KindExec,
-		"":                            KindExec,
-		"-- comment\nSELECT 1":        KindQuery,
+		"SHOW TABLES":                  KindQuery,
+		"DESC t":                       KindQuery,
+		"DESCRIBE t":                   KindQuery,
+		"EXPLAIN SELECT 1":             KindQuery,
+		"VALUES (1)":                   KindQuery,
+		"TABLE t":                      KindQuery, // standard SQL: TABLE x is shorthand for SELECT * FROM x
+		"(SELECT 1)":                   KindQuery, // parenthesised SELECT
+		"  (  SELECT 1 )":              KindQuery,
+		"UPDATE t SET x=1":             KindExec,
+		"INSERT INTO t VALUES (1)":     KindExec,
+		"DELETE FROM t":                KindExec,
+		"DROP TABLE t":                 KindExec,
+		"CREATE TABLE t (id int)":      KindExec,
+		"TRUNCATE TABLE t":             KindExec,
+		"BEGIN":                        KindExec,
+		"COMMIT":                       KindExec,
+		"":                             KindExec,
+		"-- comment\nSELECT 1":         KindQuery,
 		"-- comment\nUPDATE t SET x=1": KindExec,
 	}
 	for in, want := range cases {
@@ -171,10 +171,11 @@ func TestRunScript_DispatchesByKind(t *testing.T) {
 			return QueryResult{
 				Columns: []QueryColumn{{Name: "x"}, {Name: "y"}},
 				Rows:    [][]any{{"a", "b"}, {"c", "d"}},
+				TookMs:  17,
 			}, nil
 		},
 		ExecHandler: func(_ context.Context, s string) (ExecResult, error) {
-			return ExecResult{AffectedRows: 3}, nil
+			return ExecResult{AffectedRows: 3, TookMs: 23}, nil
 		},
 	}
 	res := RunScript(context.Background(), op, "SELECT 1; UPDATE t SET x=1", 100, time.Second, time.Second)
@@ -186,6 +187,9 @@ func TestRunScript_DispatchesByKind(t *testing.T) {
 	}
 	if res.Statements[1].Type != "exec" || res.Statements[1].AffectedRows != 3 {
 		t.Fatalf("statement 1 wrong: %+v", res.Statements[1])
+	}
+	if res.Statements[0].TookMs != 17 || res.Statements[1].TookMs != 23 {
+		t.Fatalf("statement timing not propagated: %+v", res.Statements)
 	}
 	if res.FirstError != "" {
 		t.Fatalf("expected no error, got %q", res.FirstError)
@@ -248,7 +252,7 @@ func TestRunScript_TruncatesRows(t *testing.T) {
 
 func TestRunScript_ClampsMaxRows(t *testing.T) {
 	op := &FakeOp{
-		Driver:     "mysql",
+		Driver: "mysql",
 		QueryHandler: func(_ context.Context, s string, maxRows int) (QueryResult, error) {
 			return QueryResult{}, nil
 		},
@@ -355,16 +359,9 @@ func TestSQLOp_DSNEscapesPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// mysqlDSNEscape only touches '@' and ':' in userinfo. Other special
-	// chars (';', '/', '?', '#', '=', ' ', '&') must pass through verbatim
-	// so the server's handshake compares the same bytes against the hash.
-	if !strings.Contains(dsn, "u:p;w%40rd/x?#= &") {
-		t.Fatalf("DSN must keep password bytes verbatim except for '@' (and ':'), got %q", dsn)
-	}
-	// The raw '@' inside the password must be escaped, otherwise
-	// go-sql-driver would treat everything after it as the host.
-	if strings.Contains(dsn, "u:p;w@rd") {
-		t.Fatalf("DSN must escape '@' in userinfo, got %q", dsn)
+	// ParseDSN separates at the last '@' and does not URL-decode userinfo.
+	if !strings.Contains(dsn, "u:p;w@rd/x?#= &@tcp(") {
+		t.Fatalf("DSN must keep password bytes verbatim, got %q", dsn)
 	}
 }
 
@@ -389,8 +386,8 @@ func TestSQLOp_DSNPreservesExclamation(t *testing.T) {
 // empty-user/no-password bug: ensureOpenLocked must forward User and
 // Password into buildDSN. Pre-fix, the produced DSN started with ":@tcp("
 // (no user, no password) and MySQL returned "Access denied for user
-// ''@'…' (using password: NO)". Post-fix, the DSN must embed the user
-// and the URL-escaped password.
+// ”@'…' (using password: NO)". Post-fix, the DSN must embed the user
+// and the byte-exact password.
 func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
 	cases := []struct {
 		name string
@@ -409,9 +406,8 @@ func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
 			},
 		},
 		{
-			// Regression: if mysqlDSNEscape ever forgets ':', the password
-			// would split into user/pass and the server would see the wrong
-			// hash. Must escape both ':' and '@'.
+			// ParseDSN permits ':' and '@' inside the password: it separates
+			// at the first ':' and last '@'. They must remain byte-exact.
 			name: "mysql password with both delimiters",
 			cfg: &config.DBConfig{
 				Host: "h", Port: 3306, User: "u", Password: "p:a@s:s", Database: "d",
@@ -453,11 +449,9 @@ func TestSQLOp_EnsureOpenCarriesCredentials(t *testing.T) {
 			if !strings.Contains(capturedDSN, c.cfg.User+":") {
 				t.Fatalf("DSN %q does not carry user %q", capturedDSN, c.cfg.User)
 			}
-			// Must carry the password verbatim except for the DSN delimiters
-			// '@' and ':' (which mysqlDSNEscape escapes). url.QueryEscape
-			// would turn '!' into '%21' and mysql_native_password would
-			// reject the connection with 1045.
-			wantPass := mysqlDSNEscape(c.cfg.Password)
+			// Password must be byte-exact; URL escaping would alter what the
+			// MySQL authentication handshake receives.
+			wantPass := c.cfg.Password
 			if !strings.Contains(capturedDSN, ":"+wantPass+"@") {
 				t.Fatalf("DSN %q does not carry password %q", capturedDSN, wantPass)
 			}
@@ -485,9 +479,46 @@ type dbopFakeConn struct{}
 func (dbopFakeConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("dbop-fake: prepare unsupported")
 }
+
+func TestSQLOp_OracleDSNEscapesURLUserInfo(t *testing.T) {
+	cfg := &config.DBConfig{Host: "h", Port: 1521, User: "u@example", Password: "p?@#/ x", Database: "ORCL"}
+	dsn, err := buildDSN("oracle", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"u@example", "p?@#/ x"} {
+		if strings.Contains(dsn, raw) {
+			t.Fatalf("Oracle URL userinfo contains unescaped %q: %q", raw, dsn)
+		}
+	}
+	if !strings.Contains(dsn, "u%40example:p%3F%40%23%2F%20x@h:1521/ORCL") {
+		t.Fatalf("unexpected Oracle DSN escaping: %q", dsn)
+	}
+}
+
+func TestSQLOp_SQLServerTLSOptions(t *testing.T) {
+	cfg := &config.DBConfig{
+		Host: "h", User: "u", Password: "p", Database: "d",
+		Encrypt: "disable", TLSMin: "1.0", TrustCert: true, HostnameInCert: "db.internal",
+	}
+	dsn, err := buildDSN("sqlserver", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"encrypt=disable", "tlsmin=1.0", "trustservercertificate=true", "hostnameincertificate=db.internal"} {
+		if !strings.Contains(dsn, want) {
+			t.Fatalf("SQL Server DSN %q missing %q", dsn, want)
+		}
+	}
+}
 func (dbopFakeConn) Close() error               { return nil }
-func (dbopFakeConn) Begin() (driver.Tx, error)  { return nil, errors.New("dbop-fake: tx unsupported") }
+func (dbopFakeConn) Begin() (driver.Tx, error)  { return dbopFakeTx{}, nil }
 func (dbopFakeConn) Ping(context.Context) error { return nil }
+
+type dbopFakeTx struct{}
+
+func (dbopFakeTx) Commit() error   { return nil }
+func (dbopFakeTx) Rollback() error { return nil }
 
 func (dbopFakeConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
 	return dbopFakeRows{}, nil
@@ -575,8 +606,8 @@ func TestSQLOp_StatusLazilyOpens(t *testing.T) {
 
 func TestIsRetryable(t *testing.T) {
 	cases := []struct {
-		err   error
-		want  bool
+		err  error
+		want bool
 	}{
 		{nil, false},
 		{context.Canceled, false},

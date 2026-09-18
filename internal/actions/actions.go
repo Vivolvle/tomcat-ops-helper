@@ -291,6 +291,7 @@ func (r *Registry) dbOperator(ctx context.Context, toolName string, params json.
 	if res.Database == "" {
 		res.Database = st.Database
 	}
+	res.CurrentSchema = st.CurrentSchema
 	return mustMarshal(res), nil
 }
 

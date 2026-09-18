@@ -62,15 +62,16 @@ type Op interface {
 // failed to (re)open; LastError carries the most recent failure reason
 // and LastErrorAt its timestamp.
 type Status struct {
-	Configured  bool       `json:"configured"`
-	Open        bool       `json:"open"`
-	Driver      string     `json:"driver,omitempty"`
-	Host        string     `json:"host,omitempty"`
-	Port        int        `json:"port,omitempty"`
-	Database    string     `json:"database,omitempty"`
-	LatencyMs   int64      `json:"latency_ms,omitempty"`
-	LastError   string     `json:"last_error,omitempty"`
-	LastErrorAt *time.Time `json:"last_error_at,omitempty"`
+	Configured    bool       `json:"configured"`
+	Open          bool       `json:"open"`
+	Driver        string     `json:"driver,omitempty"`
+	Host          string     `json:"host,omitempty"`
+	Port          int        `json:"port,omitempty"`
+	Database      string     `json:"database,omitempty"`
+	CurrentSchema string     `json:"current_schema,omitempty"`
+	LatencyMs     int64      `json:"latency_ms,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
 }
 
 // QueryColumn is one column of a Query result.
@@ -110,29 +111,30 @@ const (
 // union shape mirrors what Navicat shows: queries get columns + rows,
 // exec gets affected_rows.
 type StatementResult struct {
-	Index        int          `json:"index"`
+	Index        int           `json:"index"`
 	Kind         StatementKind `json:"-"`
-	Type         string       `json:"type"` // "query" or "exec"
-	SQL          string       `json:"sql,omitempty"`
+	Type         string        `json:"type"` // "query" or "exec"
+	SQL          string        `json:"sql,omitempty"`
 	Columns      []QueryColumn `json:"columns,omitempty"`
 	Rows         [][]any       `json:"rows,omitempty"`
 	RowCount     int           `json:"row_count,omitempty"`
-	Truncated    bool         `json:"truncated,omitempty"`
-	AffectedRows int64        `json:"affected_rows,omitempty"`
-	LastInsertID string       `json:"last_insert_id,omitempty"`
-	TookMs       int64        `json:"took_ms"`
-	Error        string       `json:"error,omitempty"`
+	Truncated    bool          `json:"truncated,omitempty"`
+	AffectedRows int64         `json:"affected_rows,omitempty"`
+	LastInsertID string        `json:"last_insert_id,omitempty"`
+	TookMs       int64         `json:"took_ms"`
+	Error        string        `json:"error,omitempty"`
 }
 
 // RunScriptResult is the JSON the action returns to the operator.
 type RunScriptResult struct {
-	Driver       string           `json:"driver"`
-	Database     string           `json:"database,omitempty"`
-	Statements   []StatementResult `json:"statements"`
-	TotalTookMs  int64            `json:"total_took_ms"`
-	Truncated    bool             `json:"truncated,omitempty"`
-	FirstError   string           `json:"first_error,omitempty"`
-	FirstErrorAt int              `json:"first_error_at,omitempty"` // index of first failed statement
+	Driver        string            `json:"driver"`
+	Database      string            `json:"database,omitempty"`
+	CurrentSchema string            `json:"current_schema,omitempty"`
+	Statements    []StatementResult `json:"statements"`
+	TotalTookMs   int64             `json:"total_took_ms"`
+	Truncated     bool              `json:"truncated,omitempty"`
+	FirstError    string            `json:"first_error,omitempty"`
+	FirstErrorAt  int               `json:"first_error_at,omitempty"` // index of first failed statement
 }
 
 // RunScript splits script into statements, dispatches each via Query or
@@ -169,6 +171,7 @@ func RunScript(ctx context.Context, op Op, script string, maxRows int, perStatem
 		s := st.Status(scriptCtx)
 		res.Driver = s.Driver
 		res.Database = s.Database
+		res.CurrentSchema = s.CurrentSchema
 	}
 
 	stmts := SplitScript(script)
@@ -214,7 +217,7 @@ func RunScript(ctx context.Context, op Op, script string, maxRows int, perStatem
 					res.Truncated = true
 				}
 			}
-			sr.TookMs = stmtTookMs(stmtCtx, started)
+			sr.TookMs = qr.TookMs
 		default: // KindExec (also covers KindUnknown — safer to treat as exec)
 			sr.Type = "exec"
 			er, err := op.Exec(stmtCtx, stmt)
@@ -224,7 +227,7 @@ func RunScript(ctx context.Context, op Op, script string, maxRows int, perStatem
 				sr.AffectedRows = er.AffectedRows
 				sr.LastInsertID = er.LastInsertID
 			}
-			sr.TookMs = stmtTookMs(stmtCtx, started)
+			sr.TookMs = er.TookMs
 		}
 		stmtCancel()
 		res.Statements = append(res.Statements, sr)
@@ -238,19 +241,6 @@ func RunScript(ctx context.Context, op Op, script string, maxRows int, perStatem
 	}
 	res.TotalTookMs = time.Since(started).Milliseconds()
 	return res
-}
-
-// stmtTookMs is a best-effort "how long has this statement been
-// running" estimate derived from the context. We don't keep a per-call
-// start because the underlying *sql.DB call already records its own
-// duration; this number is exposed for the operator's UI and is good
-// enough.
-func stmtTookMs(ctx context.Context, _ time.Time) int64 {
-	if d, ok := ctx.Deadline(); ok {
-		// Cheap proxy: time since ctx was made. Not exact but stable.
-		_ = d
-	}
-	return 0
 }
 
 // ErrNotConfigured is returned by Status when the connector was never

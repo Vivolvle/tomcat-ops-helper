@@ -15,9 +15,10 @@ import (
 type FakeOp struct {
 	mu sync.Mutex
 
-	Driver   string
-	Database string
-	Host     string
+	Driver        string
+	Database      string
+	CurrentSchema string
+	Host          string
 
 	// Open toggles Status.Open. Defaults to true.
 	Open bool
@@ -51,11 +52,12 @@ func (f *FakeOp) Status(ctx context.Context) Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	st := Status{
-		Configured: true,
-		Open:       f.Open,
-		Driver:     f.Driver,
-		Host:       f.Host,
-		Database:   f.Database,
+		Configured:    true,
+		Open:          f.Open,
+		Driver:        f.Driver,
+		Host:          f.Host,
+		Database:      f.Database,
+		CurrentSchema: f.CurrentSchema,
 	}
 	if f.LastError != "" {
 		st.LastError = f.LastError

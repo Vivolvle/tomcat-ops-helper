@@ -202,9 +202,9 @@ var dbOpToolDefs = []Tool{
 		Name: "esb_db_operator",
 		Description: "Run a SQL script against the ESB MySQL 8 connector configured in config.json's \"esb\" block. " +
 			"Statements starting with SELECT / SHOW / DESC / EXPLAIN / WITH / VALUES / TABLE are run as queries and " +
-			"return rows; everything else is run as exec and returns affected_rows. Multi-statement scripts are " +
+			"return rows; everything else runs in its own committed transaction and returns affected_rows. Multi-statement scripts are " +
 			"supported (semicolon-separated); execution stops at the first error and the partial result is returned. " +
-			"Connection is opened once at helper startup; reconnects on transient errors are automatic.",
+			"Do not include BEGIN/COMMIT/ROLLBACK: each non-query statement is already atomic. Read queries retry once on stale connections; writes are never replayed automatically.",
 		InputSchema: dbOpSchema,
 	},
 	{
@@ -212,8 +212,8 @@ var dbOpToolDefs = []Tool{
 		Description: "Run a SQL script against the ERP connector configured in config.json's \"erp\" block. The " +
 			"driver is chosen by config.json (\"type\": \"oracle\" | \"sqlserver\"); the same call shape works for " +
 			"both. Statements starting with SELECT / SHOW / DESC / EXPLAIN / WITH / VALUES / TABLE return rows; " +
-			"everything else returns affected_rows. Multi-statement scripts (semicolon-separated) stop at the first " +
-			"error. Connection is opened once at helper startup and reconnected on transient errors.",
+			"everything else runs in its own committed transaction and returns affected_rows. Multi-statement scripts (semicolon-separated) stop at the first " +
+			"error. Do not include BEGIN/COMMIT/ROLLBACK. Read queries retry once on stale connections; writes are never replayed automatically.",
 		InputSchema: dbOpSchema,
 	},
 }

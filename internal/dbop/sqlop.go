@@ -12,9 +12,9 @@ import (
 
 	"tomcat-ops-helper/internal/config"
 
-	_ "github.com/go-sql-driver/mysql"     // mysql driver
-	_ "github.com/microsoft/go-mssqldb"    // sqlserver driver (registers "sqlserver")
-	_ "github.com/sijms/go-ora/v2"         // oracle driver (registers "oracle")
+	_ "github.com/go-sql-driver/mysql"  // mysql driver
+	_ "github.com/microsoft/go-mssqldb" // sqlserver driver (registers "sqlserver")
+	_ "github.com/sijms/go-ora/v2"      // oracle driver (registers "oracle")
 )
 
 // SQLOp is the production Op: a thin wrapper around *sql.DB that adds
@@ -22,18 +22,22 @@ import (
 // reconnect-then-retry when a statement hits a stale or dead
 // connection. Pool sizing itself is left to SetMax{Open,Idle}Conns.
 type SQLOp struct {
-	driver   string
-	host     string
-	port     int
-	user     string
-	password string
-	database string
+	driver         string
+	host           string
+	port           int
+	user           string
+	password       string
+	database       string
+	encrypt        string
+	tlsMin         string
+	trustCert      bool
+	hostnameInCert string
 
-	mu      sync.Mutex
-	db      *sql.DB
-	status  Status
-	open    func(driver, dsn string) (*sql.DB, error) // overridable for tests
-	pingTO  time.Duration
+	mu     sync.Mutex
+	db     *sql.DB
+	status Status
+	open   func(driver, dsn string) (*sql.DB, error) // overridable for tests
+	pingTO time.Duration
 }
 
 // NewSQLOp opens the pool eagerly (sql.Open + Ping) and returns the
@@ -52,12 +56,16 @@ func NewSQLOp(ctx context.Context, cfg *config.DBConfig) (*SQLOp, error) {
 	port := cfg.EffectivePort(driver)
 	database := cfg.Database
 	op := &SQLOp{
-		driver:   driver,
-		host:     host,
-		port:     port,
-		user:     cfg.User,
-		password: cfg.Password,
-		database: database,
+		driver:         driver,
+		host:           host,
+		port:           port,
+		user:           cfg.User,
+		password:       cfg.Password,
+		database:       database,
+		encrypt:        cfg.Encrypt,
+		tlsMin:         cfg.TLSMin,
+		trustCert:      cfg.TrustCert,
+		hostnameInCert: cfg.HostnameInCert,
 		status: Status{
 			Configured: true,
 			Driver:     driver,
@@ -110,6 +118,11 @@ func (o *SQLOp) Status(ctx context.Context) Status {
 		if err != nil {
 			o.status.Open = false
 			o.markLocked(err)
+			// Evict a pool which failed its health check. Leaving it in place
+			// makes the next operation borrow the same dead connection before
+			// retry logic gets a chance to rebuild the pool.
+			_ = o.db.Close()
+			o.db = nil
 			return o.status
 		}
 		o.status.Open = true
@@ -130,7 +143,7 @@ func (o *SQLOp) Query(ctx context.Context, sqlText string, maxRows int) (QueryRe
 		// One reconnect-and-retry. Stale conns and idle-timeout
 		// drops surface as net errors here; we tear the pool down
 		// and rebuild so the next Ping picks up a fresh handle.
-		_ = o.closeLocked()
+		_ = o.Close()
 		if rerr := o.ensureOpen(ctx); rerr == nil {
 			qr, err = o.runQuery(ctx, sqlText, maxRows)
 		}
@@ -147,10 +160,12 @@ func (o *SQLOp) Query(ctx context.Context, sqlText string, maxRows int) (QueryRe
 func (o *SQLOp) Exec(ctx context.Context, sqlText string) (ExecResult, error) {
 	er, err := o.runExec(ctx, sqlText)
 	if err != nil && isRetryable(err) {
-		_ = o.closeLocked()
-		if rerr := o.ensureOpen(ctx); rerr == nil {
-			er, err = o.runExec(ctx, sqlText)
-		}
+		// Never replay a write automatically: the server may have committed
+		// it even when the response was lost. Drop the suspect pool so the
+		// next explicit call reconnects, but return the uncertainty to the
+		// operator instead of risking duplicate DML.
+		_ = o.Close()
+		err = fmt.Errorf("write failed on a stale connection and was not retried (commit status may be unknown): %w", err)
 	}
 	if err != nil {
 		o.mu.Lock()
@@ -177,11 +192,15 @@ func (o *SQLOp) ensureOpen(ctx context.Context) error {
 // ensureOpenLocked opens the pool and Pings it. Caller holds o.mu.
 func (o *SQLOp) ensureOpenLocked(ctx context.Context) error {
 	dsn, err := buildDSN(o.driver, &config.DBConfig{
-		Host:     o.host,
-		Port:     o.port,
-		User:     o.user,
-		Password: o.password,
-		Database: o.database,
+		Host:           o.host,
+		Port:           o.port,
+		User:           o.user,
+		Password:       o.password,
+		Database:       o.database,
+		Encrypt:        o.encrypt,
+		TLSMin:         o.tlsMin,
+		TrustCert:      o.trustCert,
+		HostnameInCert: o.hostnameInCert,
 	})
 	if err != nil {
 		o.markLocked(err)
@@ -194,7 +213,8 @@ func (o *SQLOp) ensureOpenLocked(ctx context.Context) error {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(1)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute)
+	db.SetConnMaxLifetime(5 * time.Minute)
 	pingCtx, cancel := context.WithTimeout(ctx, o.pingTO)
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
@@ -206,6 +226,9 @@ func (o *SQLOp) ensureOpenLocked(ctx context.Context) error {
 	o.status.Open = true
 	o.status.LastError = ""
 	o.status.LastErrorAt = nil
+	if schema, err := queryCurrentSchema(ctx, db, o.driver); err == nil {
+		o.status.CurrentSchema = schema
+	}
 	return nil
 }
 
@@ -247,6 +270,33 @@ func (o *SQLOp) dbHandle(ctx context.Context) (*sql.DB, error) {
 	db = o.db
 	o.mu.Unlock()
 	return db, nil
+}
+
+// queryCurrentSchema reports the session's effective schema. In Oracle the
+// configured Database is a service name and commonly differs from the schema
+// where unqualified table names resolve.
+func queryCurrentSchema(ctx context.Context, db *sql.DB, driver string) (string, error) {
+	var query string
+	switch driver {
+	case "oracle":
+		query = "SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM DUAL"
+	case "sqlserver", "mssql":
+		query = "SELECT SCHEMA_NAME()"
+	case "mysql":
+		query = "SELECT DATABASE()"
+	default:
+		return "", nil
+	}
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var schema sql.NullString
+	if err := db.QueryRowContext(qctx, query).Scan(&schema); err != nil {
+		return "", err
+	}
+	if !schema.Valid {
+		return "", nil
+	}
+	return schema.String, nil
 }
 
 func (o *SQLOp) runQuery(ctx context.Context, sqlText string, maxRows int) (QueryResult, error) {
@@ -291,9 +341,10 @@ func (o *SQLOp) runQuery(ctx context.Context, sqlText string, maxRows int) (Quer
 			out.Truncated = true
 			// Continue scanning so rows.Err is checked, but skip
 			// allocation.
+			drained := 0
 			for rows.Next() {
-				_ = rows
-				if len(out.Rows) >= maxRows*4 {
+				drained++
+				if drained >= maxRows*3 {
 					// Hard stop; the caller asked for maxRows
 					// and we know it's much more.
 					break
@@ -328,9 +379,17 @@ func (o *SQLOp) runExec(ctx context.Context, sqlText string) (ExecResult, error)
 		return ExecResult{}, err
 	}
 	start := time.Now()
-	res, err := db.ExecContext(ctx, sqlText)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
+		return ExecResult{}, fmt.Errorf("begin tx: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, sqlText)
+	if err != nil {
+		_ = tx.Rollback()
 		return ExecResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ExecResult{}, fmt.Errorf("commit: %w", err)
 	}
 	affected, _ := res.RowsAffected()
 	lastID, _ := res.LastInsertId()
@@ -405,40 +464,18 @@ func containsFold(haystack, needle string) bool {
 	return false
 }
 
-// mysqlDSNEscape escapes only the characters that would break the
-// go-sql-driver/mysql DSN parser in the userinfo segment (':' and '@').
-// Every other byte — including '!', ';', '/', '?', '#', '=', '&', ' ',
-// '*', '\'', '(', ')' — must be passed through verbatim because the
-// server's native-password handshake compares the received string
-// byte-for-byte against the stored hash. Encoding '!' as '%21' (which
-// url.QueryEscape does) makes the server see the literal six-byte
-// string "yc1234%21" instead of the seven-byte "yc1234!" and
-// authentication fails with 1045.
-func mysqlDSNEscape(s string) string {
-	r := strings.NewReplacer(
-		"@", "%40",
-		":", "%3A",
-	)
-	return r.Replace(s)
-}
-
-// buildDSN constructs the driver-specific connection string. The
-// password is URL-encoded so special characters (e.g. ';', '@', '/',
-// '?', '#') don't break parsing.
+// buildDSN constructs the driver-specific connection string. Escaping is
+// driver-specific: MySQL's DSN is not a URL, while Oracle and SQL Server are.
 func buildDSN(driver string, cfg *config.DBConfig) (string, error) {
 	port := cfg.EffectivePort(driver)
 	switch driver {
 	case "mysql":
 		// go-sql-driver/mysql DSN: user:pass@tcp(host:port)/db?...
-		// The driver parses userinfo as a single chunk between the first
-		// ':' and the '@'; anything else (including '!', ';', '/', '?')
-		// is passed verbatim to the server's handshake, which compares it
-		// against the stored hash byte-for-byte. So we must only escape
-		// the two delimiters ('@' and ':') and leave every other character
-		// intact. url.QueryEscape would turn '!' into '%21' and the server
-		// would reject the password.
-		user := mysqlDSNEscape(cfg.User)
-		pass := mysqlDSNEscape(cfg.Password)
+		// ParseDSN uses the first ':' for user/password and the last '@'
+		// before tcp(...) for password/network. It performs no URL decoding,
+		// so password bytes (including ':' and '@') must remain unchanged.
+		user := cfg.User
+		pass := cfg.Password
 		host := cfg.Host
 		if port > 0 {
 			host = fmt.Sprintf("%s:%d", cfg.Host, port)
@@ -459,19 +496,29 @@ func buildDSN(driver string, cfg *config.DBConfig) (string, error) {
 		}
 		q.Set("dial timeout", "10")
 		q.Set("connection timeout", "10")
+		if v := strings.TrimSpace(cfg.Encrypt); v != "" {
+			q.Set("encrypt", v)
+		}
+		if v := strings.TrimSpace(cfg.TLSMin); v != "" {
+			q.Set("tlsmin", v)
+		}
+		if cfg.TrustCert {
+			q.Set("trustservercertificate", "true")
+		}
+		if v := strings.TrimSpace(cfg.HostnameInCert); v != "" {
+			q.Set("hostnameincertificate", v)
+		}
 		return q.Encode(), nil
 	case "oracle":
 		// sijms/go-ora/v2 DSN: oracle://user:pass@host:port/service_name
-		// Same rule as mysql: only escape DSN delimiters in userinfo;
-		// leave the password otherwise verbatim so '!' and friends reach
-		// the server unchanged.
-		user := mysqlDSNEscape(cfg.User)
-		pass := mysqlDSNEscape(cfg.Password)
+		// Use URL userinfo escaping so ?, #, /, spaces, @ and : cannot alter
+		// the URL structure. This differs from MySQL's hand-written parser.
+		userinfo := url.UserPassword(cfg.User, cfg.Password).String()
 		host := cfg.Host
 		if port > 0 {
 			host = fmt.Sprintf("%s:%d", cfg.Host, port)
 		}
-		return fmt.Sprintf("oracle://%s:%s@%s/%s", user, pass, host, cfg.Database), nil
+		return fmt.Sprintf("oracle://%s@%s/%s", userinfo, host, cfg.Database), nil
 	}
 	return "", fmt.Errorf("unsupported driver %q", driver)
 }
