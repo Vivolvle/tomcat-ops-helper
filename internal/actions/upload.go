@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // uploadChunkSize is the canonical chunk size used by the server's
@@ -88,6 +89,30 @@ func newUploadRegistry() *uploadRegistry {
 	return &uploadRegistry{sessions: make(map[string]*uploadSession)}
 }
 
+// cleanupStale removes sessions older than maxAge. Called periodically by
+// the helper to avoid .tmp accumulation when server disconnects without
+// sending cancel_upload.
+func (u *uploadRegistry) cleanupStale(maxAge time.Duration) int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	now := time.Now()
+	removed := 0
+	for id, sess := range u.sessions {
+		sess.mu.Lock()
+		if sess.f != nil {
+			if info, err := sess.f.Stat(); err == nil {
+				if now.Sub(info.ModTime()) > maxAge {
+					sess.closeAndRemove()
+					delete(u.sessions, id)
+					removed++
+				}
+			}
+		}
+		sess.mu.Unlock()
+	}
+	return removed
+}
+
 func (u *uploadRegistry) get(id string) (*uploadSession, bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -111,6 +136,30 @@ func (u *uploadRegistry) del(id string) {
 		s.closeAndRemove()
 	}
 	delete(u.sessions, id)
+}
+
+// cancelUpload aborts an in-flight upload and removes its .tmp file.
+// Called by the server when a stall is detected or the operator cancels.
+func (r *Registry) cancelUpload(params json.RawMessage) (json.RawMessage, error) {
+	var p struct {
+		UploadID string `json:"upload_id"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("cancel_upload: params: %w", err)
+	}
+	if p.UploadID == "" {
+		return nil, fmt.Errorf("%w: upload_id", ErrMissingField)
+	}
+	sess, exists := r.uploads.get(p.UploadID)
+	if !exists {
+		// Already cleaned up or never existed — success either way.
+		return mustMarshal(map[string]any{"cancelled": true, "upload_id": p.UploadID, "was_active": false}), nil
+	}
+	sess.mu.Lock()
+	tmpPath := sess.tmpPath
+	sess.mu.Unlock()
+	r.uploads.del(p.UploadID)
+	return mustMarshal(map[string]any{"cancelled": true, "upload_id": p.UploadID, "was_active": true, "tmp_removed": tmpPath}), nil
 }
 
 // uploadFile handles a single chunk of the upload_file action. The

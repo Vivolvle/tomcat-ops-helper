@@ -95,6 +95,7 @@ func main() {
 	agentMux.HandleFunc("/mcp/tools", relay.handleMcpTools)
 	agentMux.HandleFunc("/mcp/call", relay.handleMcpCall)
 	agentMux.HandleFunc("/upload", relay.handleUpload)
+	agentMux.HandleFunc("/upload/", relay.handleUploadProgress)
 	agentServer := &http.Server{
 		Addr:              cfg.AgentListen,
 		Handler:           agentMux,
@@ -142,6 +143,16 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
+// uploadProgressInfo tracks the progress of an in-flight upload.
+type uploadProgressInfo struct {
+	TotalBytes   int64
+	WrittenBytes int64
+	Path         string
+	ClientID     string
+	StartedAt    time.Time
+	LastUpdate   time.Time
+}
+
 // relay wires client registration, command dispatch, and result collection.
 type relay struct {
 	cfg    *config.ServerConfig
@@ -153,18 +164,23 @@ type relay struct {
 	pending map[string]chan protocol.Result
 	tools   map[string][]protocol.ToolMeta // keyed by client_id
 
+	// uploadProgress tracks in-flight uploads for progress queries.
+	uploadProgress   map[string]*uploadProgressInfo
+	uploadProgressMu sync.Mutex
+
 	// problemMu serializes appends to the server-local problem log.
 	problemMu sync.Mutex
 }
 
 func newRelay(cfg *config.ServerConfig, logger *log.Logger, audit func(map[string]any)) *relay {
 	return &relay{
-		cfg:     cfg,
-		logger:  logger,
-		audit:   audit,
-		clients: map[string]*wsserver.Client{},
-		pending: map[string]chan protocol.Result{},
-		tools:   map[string][]protocol.ToolMeta{},
+		cfg:            cfg,
+		logger:         logger,
+		audit:          audit,
+		clients:        map[string]*wsserver.Client{},
+		pending:        map[string]chan protocol.Result{},
+		tools:          map[string][]protocol.ToolMeta{},
+		uploadProgress: map[string]*uploadProgressInfo{},
 	}
 }
 
@@ -641,11 +657,16 @@ func (r *relay) handleUpload(w http.ResponseWriter, req *http.Request) {
 	cid := req.FormValue("client_id")
 	timeoutSec, _ := strconv.ParseFloat(req.FormValue("timeout"), 64)
 	if timeoutSec <= 0 {
-		timeoutSec = 30
+		timeoutSec = 60 // 60s default, up from 30s — large files need more headroom
 	}
 	timeout := time.Duration(timeoutSec * float64(time.Second))
 
-	fileHdr, _, err := req.FormFile("file")
+	// Stall detection: if no chunk completes within this duration, abort.
+	// 5 minutes covers slow links (234 MB over 3G = ~100KB/s = ~40 min total,
+	// but each 64KB chunk should finish in <60s even at 1KB/s).
+	stallTimeout := 5 * time.Minute
+
+	fileHdr, fileHeader, err := req.FormFile("file")
 	if err != nil {
 		http.Error(w, "file: "+err.Error(), http.StatusBadRequest)
 		return
@@ -688,13 +709,50 @@ func (r *relay) handleUpload(w http.ResponseWriter, req *http.Request) {
 		"ts":        time.Now().UTC().Format(time.RFC3339Nano),
 	})
 
+	// Get total file size for progress reporting.
+	totalBytes := fileHeader.Size
+	r.uploadProgressMu.Lock()
+	r.uploadProgress[uploadID] = &uploadProgressInfo{
+		TotalBytes:   totalBytes,
+		WrittenBytes: 0,
+		Path:         path,
+		ClientID:     client.ID,
+		StartedAt:    started,
+		LastUpdate:   started,
+	}
+	r.uploadProgressMu.Unlock()
+	defer func() {
+		r.uploadProgressMu.Lock()
+		delete(r.uploadProgress, uploadID)
+		r.uploadProgressMu.Unlock()
+	}()
+
 	// Stream chunks sequentially: send one Command, wait for its Result,
 	// then send the next. Pipelining could speed this up significantly
 	// but complicates failure handling — start simple.
 	buf := make([]byte, uploadChunkSize)
 	var offset int64
 	var final protocol.Result
+	lastProgressTime := time.Now()
+	chunkCount := 0
 	for {
+		// Stall detection: if no chunk completed in stallTimeout, abort.
+		if time.Since(lastProgressTime) > stallTimeout {
+			r.audit(map[string]any{
+				"event":     "upload_stall_abort",
+				"client_id": client.ID,
+				"upload_id": uploadID,
+				"offset":    offset,
+				"stalled":   time.Since(lastProgressTime).String(),
+				"ts":        time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			// Tell helper to clean up the .tmp file.
+			cancelParams, _ := json.Marshal(map[string]any{"upload_id": uploadID})
+			cancelCmd := protocol.Command{ID: protocol.NewID(), Action: "cancel_upload", Params: cancelParams}
+			_ = client.Send(req.Context(), cancelCmd)
+			http.Error(w, fmt.Sprintf("upload stalled: no progress for %s at offset %d/%d", time.Since(lastProgressTime).Round(time.Second), offset, totalBytes), http.StatusGatewayTimeout)
+			return
+		}
 		n, readErr := io.ReadFull(fileHdr, buf)
 		isLast := readErr == io.EOF || readErr == io.ErrUnexpectedEOF
 		if n == 0 {
@@ -758,6 +816,10 @@ func (r *relay) handleUpload(w http.ResponseWriter, req *http.Request) {
 					"error":     res.Error,
 					"ts":        time.Now().UTC().Format(time.RFC3339Nano),
 				})
+				// Tell helper to clean up the .tmp file.
+				cancelParams, _ := json.Marshal(map[string]any{"upload_id": uploadID})
+				cancelCmd := protocol.Command{ID: protocol.NewID(), Action: "cancel_upload", Params: cancelParams}
+				_ = client.Send(req.Context(), cancelCmd)
 				http.Error(w, "upload chunk failed: "+res.Error, http.StatusBadGateway)
 				return
 			}
@@ -775,11 +837,29 @@ func (r *relay) handleUpload(w http.ResponseWriter, req *http.Request) {
 				"offset":    offset,
 				"ts":        time.Now().UTC().Format(time.RFC3339Nano),
 			})
+			// Tell helper to clean up the .tmp file.
+			cancelParams, _ := json.Marshal(map[string]any{"upload_id": uploadID})
+			cancelCmd := protocol.Command{ID: protocol.NewID(), Action: "cancel_upload", Params: cancelParams}
+			_ = client.Send(req.Context(), cancelCmd)
 			http.Error(w, fmt.Sprintf("timeout after %s on chunk at offset %d", timeout, offset), http.StatusGatewayTimeout)
 			return
 		}
 
 		offset += int64(n)
+		chunkCount++
+		lastProgressTime = time.Now()
+		r.uploadProgressMu.Lock()
+		if info, ok := r.uploadProgress[uploadID]; ok {
+			info.WrittenBytes = offset
+			info.LastUpdate = lastProgressTime
+		}
+		r.uploadProgressMu.Unlock()
+		// Log progress every 100 chunks (~6.4 MB) so operator can see movement.
+		if chunkCount%100 == 0 {
+			pct := float64(offset) / float64(totalBytes) * 100
+			r.logger.Printf("upload %s: %d/%d bytes (%.1f%%) chunk#%d elapsed %s",
+				uploadID, offset, totalBytes, pct, chunkCount, time.Since(started).Round(time.Second))
+		}
 		if isLast {
 			break
 		}
@@ -800,6 +880,46 @@ func (r *relay) handleUpload(w http.ResponseWriter, req *http.Request) {
 		"bytes":       offset,
 		"duration_ms": time.Since(started).Milliseconds(),
 		"result":      json.RawMessage(final.Data),
+	})
+}
+
+// handleUploadProgress returns the progress of an in-flight upload.
+// GET /upload/{upload_id}/progress
+func (r *relay) handleUploadProgress(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Extract upload_id from path: /upload/{id}/progress
+	id := strings.TrimPrefix(req.URL.Path, "/upload/")
+	id = strings.TrimSuffix(id, "/progress")
+	if id == "" {
+		http.Error(w, "upload_id required", http.StatusBadRequest)
+		return
+	}
+
+	r.uploadProgressMu.Lock()
+	info, ok := r.uploadProgress[id]
+	r.uploadProgressMu.Unlock()
+	if !ok {
+		http.Error(w, "upload not found or completed", http.StatusNotFound)
+		return
+	}
+
+	var percent float64
+	if info.TotalBytes > 0 {
+		percent = float64(info.WrittenBytes) / float64(info.TotalBytes) * 100
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"upload_id":      id,
+		"path":           info.Path,
+		"client_id":      info.ClientID,
+		"total_bytes":    info.TotalBytes,
+		"written_bytes":  info.WrittenBytes,
+		"percent":        percent,
+		"started_at":     info.StartedAt.UTC().Format(time.RFC3339Nano),
+		"last_update":    info.LastUpdate.UTC().Format(time.RFC3339Nano),
+		"elapsed_ms":     time.Since(info.StartedAt).Milliseconds(),
 	})
 }
 

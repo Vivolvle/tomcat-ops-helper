@@ -85,6 +85,14 @@ func (r *Registry) WithDB(toolName string, op dbop.Op) *Registry {
 	return r
 }
 
+// CleanupStaleUploads removes upload sessions that have been idle for
+// longer than maxAge. Should be called periodically (e.g. every 5 min)
+// to prevent .tmp file accumulation when the server disconnects without
+// sending cancel_upload.
+func (r *Registry) CleanupStaleUploads(maxAge time.Duration) int {
+	return r.uploads.cleanupStale(maxAge)
+}
+
 // Dispatch routes an action by name.
 func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMessage) (json.RawMessage, error) {
 	switch name {
@@ -110,6 +118,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.appendTextFile(params)
 	case "upload_file":
 		return r.uploadFile(params)
+	case "cancel_upload":
+		return r.cancelUpload(params)
 	case "validate_config":
 		return r.validateConfig(ctx)
 	case "esb_db_operator", "erp_db_operator":

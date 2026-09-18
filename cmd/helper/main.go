@@ -110,6 +110,22 @@ func main() {
 		cancel()
 	}()
 
+	// Periodic cleanup of stale upload sessions (orphaned .tmp files).
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n := registry.CleanupStaleUploads(10 * time.Minute); n > 0 {
+					logger.Printf("upload cleanup: removed %d stale session(s)", n)
+				}
+			}
+		}
+	}()
+
 	client, err := wsclient.New(wsclient.Options{
 		URL:                cfg.ServerURL,
 		Token:              cfg.Token,
