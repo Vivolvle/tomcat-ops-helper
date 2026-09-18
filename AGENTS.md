@@ -69,6 +69,10 @@ Inspector, opencode, or any other MCP client), follow these rules:
   no helper is connected) instead of only mentioning it in chat or silently
   working around it. Entries are appended to `problem.md` (same directory as
   `todo.md`), which the operator reviews periodically.
+- **Clear resolved problems.** After every item in `problem.md` has been
+  implemented and verified, remove the completed entries from `problem.md` so
+  it contains only pending work. Always preserve the explanatory header and
+  its `report_problem` append marker; never delete or empty the file itself.
 - For the `exec` tool: Windows paths in arguments **must** use `\\` (JSON
   escaping). The bridge itself enforces `work_dir` against the helper's
   `allowed_dirs` whitelist — getting `work dir not allowed` is correct
@@ -334,9 +338,10 @@ Notes:
 - `timeout` is per-chunk in seconds (default 30). For a 50 MB upload
   expect ~80 round-trips of 64 KB chunks — most of the time is server
   ↔ helper latency, not the bytes themselves.
-- The MCP `upload_file` tool is exposed for protocol completeness but
-  is not driven via the LLM by design (chunked base64 in a tool-call
-  payload burns context). Use the HTTP endpoint above instead.
+- The internal `upload_file` action is intentionally **not advertised** in
+  MCP `tools/list`. It exists only as the helper-side chunk protocol driven by
+  server.exe's `POST /upload`; agents must use the HTTP endpoint above instead
+  of sending base64 chunks through tool calls.
 
 ## Adding or changing a tool (do this on helper only)
 

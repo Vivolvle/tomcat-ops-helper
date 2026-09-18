@@ -2,6 +2,7 @@ package actions
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -70,6 +71,25 @@ func TestUploadFile_SingleChunk_Success(t *testing.T) {
 	}
 	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
 		t.Fatalf(".tmp leftover: %v", err)
+	}
+}
+
+func TestUploadFile_IsInternalAndNotAdvertised(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	for _, tool := range reg.Tools() {
+		if tool.Name == "upload_file" {
+			t.Fatal("upload_file must stay hidden from MCP tools; agents should use POST /upload")
+		}
+	}
+	dst := filepath.Join(cfg.LogDir, "via-dispatch.bin")
+	body := []byte("internal protocol still works")
+	_, err := reg.Dispatch(context.Background(), "upload_file", mustMarshal(map[string]any{
+		"path": dst, "upload_id": "internal", "chunk": base64.StdEncoding.EncodeToString(body),
+		"chunk_offset": 0, "chunk_done": true, "expected_sha256": sha256Hex(body),
+	}))
+	if err != nil {
+		t.Fatalf("internal dispatch: %v", err)
 	}
 }
 
