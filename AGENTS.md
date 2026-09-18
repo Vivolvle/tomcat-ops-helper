@@ -152,9 +152,12 @@ function instead of writing to disk.
 - Helper logs go to stdout and to `helper.log` (audit). Server writes
   `audit.log` JSONL.
 - Database writes run in an explicit per-statement transaction. Do not put
-  `BEGIN` / `COMMIT` / `ROLLBACK` into dbop scripts. Read queries may retry
+  standalone transaction-control `BEGIN` / `COMMIT` / `ROLLBACK` into dbop scripts. Read queries may retry
   once after a stale connection; writes are deliberately never replayed
   automatically because a lost commit response makes their outcome unknown.
+- Oracle PL/SQL blocks are accepted as one statement even with internal
+  semicolons. A SQL*Plus `/` on its own line terminates the block and is
+  stripped before execution; it is not Oracle SQL and must not reach go-ora.
 - Default helper.exe is built **with console** for visibility. For stealth,
   rebuild with `-ldflags="-H windowsgui -s -w"`. `run-helper.ps1` has the note.
 

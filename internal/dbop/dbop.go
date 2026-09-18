@@ -174,7 +174,7 @@ func RunScript(ctx context.Context, op Op, script string, maxRows int, perStatem
 		res.CurrentSchema = s.CurrentSchema
 	}
 
-	stmts := SplitScript(script)
+	stmts := SplitScriptForDriver(script, res.Driver)
 	for i, raw := range stmts {
 		if scriptCtx.Err() != nil {
 			sr := StatementResult{Index: i, SQL: raw}

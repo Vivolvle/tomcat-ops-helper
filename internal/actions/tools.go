@@ -213,7 +213,8 @@ var dbOpToolDefs = []Tool{
 			"driver is chosen by config.json (\"type\": \"oracle\" | \"sqlserver\"); the same call shape works for " +
 			"both. Statements starting with SELECT / SHOW / DESC / EXPLAIN / WITH / VALUES / TABLE return rows; " +
 			"everything else runs in its own committed transaction and returns affected_rows. Multi-statement scripts (semicolon-separated) stop at the first " +
-			"error. Do not include BEGIN/COMMIT/ROLLBACK. Read queries retry once on stale connections; writes are never replayed automatically.",
+			"error. Oracle PL/SQL blocks (DECLARE/BEGIN or CREATE TRIGGER/PROCEDURE/FUNCTION/PACKAGE/TYPE) retain internal semicolons; an optional SQL*Plus '/' line is removed before execution. " +
+			"Do not include transaction-control BEGIN/COMMIT/ROLLBACK. Read queries retry once on stale connections; writes are never replayed automatically.",
 		InputSchema: dbOpSchema,
 	},
 }

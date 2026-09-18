@@ -111,6 +111,62 @@ func TestSplitScript_OnlyWhitespace(t *testing.T) {
 	}
 }
 
+func TestSplitScriptForDriver_OracleTriggerBlock(t *testing.T) {
+	script := `CREATE OR REPLACE TRIGGER TRG_ESB_EVENT_ID
+BEFORE INSERT ON ESB_EVENT FOR EACH ROW
+WHEN (NEW.ID IS NULL)
+BEGIN
+  :NEW.ID := SEQ_ESB_EVENT.NEXTVAL;
+END;
+/
+SELECT 1 FROM DUAL;`
+	got := SplitScriptForDriver(script, "oracle")
+	if len(got) != 2 {
+		t.Fatalf("expected trigger + select, got %d: %#v", len(got), got)
+	}
+	if !strings.Contains(got[0], ":NEW.ID := SEQ_ESB_EVENT.NEXTVAL;") || !strings.HasSuffix(got[0], "END;") {
+		t.Fatalf("PL/SQL block was split or changed: %q", got[0])
+	}
+	if strings.Contains(got[0], "\n/") || strings.TrimSpace(got[1]) != "SELECT 1 FROM DUAL" {
+		t.Fatalf("SQL*Plus slash was not removed cleanly: %#v", got)
+	}
+}
+
+func TestSplitScriptForDriver_OracleAnonymousBlockWithoutSlash(t *testing.T) {
+	script := `BEGIN
+  INSERT INTO t(id) VALUES (1);
+  UPDATE t SET id = 2 WHERE id = 1;
+END;`
+	got := SplitScriptForDriver(script, "oracle")
+	if len(got) != 1 || strings.TrimSpace(got[0]) != script {
+		t.Fatalf("anonymous block should remain one statement: %#v", got)
+	}
+}
+
+func TestSplitScriptForDriver_NonOracleKeepsGenericSemicolonRules(t *testing.T) {
+	got := SplitScriptForDriver("BEGIN; UPDATE t SET x=1; COMMIT;", "sqlserver")
+	if len(got) != 3 {
+		t.Fatalf("non-Oracle script should use generic splitting, got %#v", got)
+	}
+}
+
+func TestRunScript_OraclePLSQLExecutesOnce(t *testing.T) {
+	op := &FakeOp{
+		Driver: "oracle",
+		ExecHandler: func(_ context.Context, sql string) (ExecResult, error) {
+			if strings.Contains(sql, "\n/") {
+				t.Fatalf("SQL*Plus slash reached Oracle driver: %q", sql)
+			}
+			return ExecResult{}, nil
+		},
+	}
+	script := "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t BEGIN :NEW.id := 1; END;\n/"
+	res := RunScript(context.Background(), op, script, 10, time.Second, time.Second)
+	if res.FirstError != "" || op.ExecCount != 1 || len(res.Statements) != 1 {
+		t.Fatalf("PL/SQL block should execute exactly once: result=%+v calls=%+v", res, op.Calls)
+	}
+}
+
 func TestRouteStatement_SelectIsQuery(t *testing.T) {
 	for _, s := range []string{"SELECT 1", "select 1", "  SELECT 1", "SELECT\n1", "select 1; ", "WITH x AS (SELECT 1) SELECT * FROM x"} {
 		if RouteStatement(s) != KindQuery {

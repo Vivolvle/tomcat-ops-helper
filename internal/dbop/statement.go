@@ -2,15 +2,12 @@ package dbop
 
 import "strings"
 
-// SplitScript breaks a SQL script into individual statements separated
-// by ';' that appears outside any string literal or comment. The split
-// is intentionally simple — it does NOT understand PL/SQL blocks, so
-// `BEGIN ... END;` will be split mid-block. Callers needing that
-// should send each PL/SQL block as its own tool call.
+// SplitScript breaks a generic SQL script into individual statements separated
+// by ';' that appears outside any string literal or comment.
 //
 // String-literal rules honoured:
 //
-//   - '…' with '' as the SQL-standard escape for one quote
+//   - '…' with ” as the SQL-standard escape for one quote
 //   - "…"  (double-quoted identifier in standard SQL; some drivers use
 //     it for string literals too)
 //   - backtick `…` (MySQL identifier quoting)
@@ -27,9 +24,22 @@ import "strings"
 // the operator actually wrote. Trailing-whitespace-only chunks are
 // dropped so "SELECT 1; " yields ["SELECT 1"], not ["SELECT 1", ""].
 func SplitScript(script string) []string {
+	return splitScript(script, false)
+}
+
+// SplitScriptForDriver applies driver-specific script rules. Oracle PL/SQL
+// blocks keep their internal semicolons and may be terminated by a SQL*Plus
+// slash on its own line. The slash is a client command, so it is removed
+// before the block is sent through database/sql.
+func SplitScriptForDriver(script, driver string) []string {
+	return splitScript(script, strings.EqualFold(driver, "oracle"))
+}
+
+func splitScript(script string, oraclePLSQL bool) []string {
 	var out []string
 	var cur strings.Builder
 	inSingle, inDouble, inBacktick, inLineComment, inBlockComment := false, false, false, false, false
+	inPLSQL := false
 	i := 0
 	for i < len(script) {
 		c := script[i]
@@ -89,6 +99,9 @@ func SplitScript(script string) []string {
 			i++
 			continue
 		default:
+			if oraclePLSQL && !inPLSQL && looksLikeOraclePLSQLStart(cur.String()+string(c)) {
+				inPLSQL = true
+			}
 			switch {
 			case c == '-' && next == '-':
 				inLineComment = true
@@ -135,7 +148,15 @@ func SplitScript(script string) []string {
 				cur.WriteString(script[i : j+2])
 				i = j + 2
 				continue
-			case c == ';':
+			case inPLSQL && c == '/' && standaloneSlash(script, i):
+				if stmt := strings.TrimSpace(cur.String()); stmt != "" {
+					out = append(out, stmt)
+				}
+				cur.Reset()
+				inPLSQL = false
+				i++
+				continue
+			case c == ';' && !inPLSQL:
 				out = append(out, cur.String())
 				cur.Reset()
 				i++
@@ -149,6 +170,51 @@ func SplitScript(script string) []string {
 		out = append(out, cur.String())
 	}
 	return out
+}
+
+func looksLikeOraclePLSQLStart(s string) bool {
+	fields := strings.Fields(strings.ToUpper(stripLeadingComments(s)))
+	if len(fields) == 0 {
+		return false
+	}
+	if fields[0] == "DECLARE" || fields[0] == "BEGIN" {
+		return true
+	}
+	if fields[0] != "CREATE" {
+		return false
+	}
+	i := 1
+	if i+1 < len(fields) && fields[i] == "OR" && fields[i+1] == "REPLACE" {
+		i += 2
+	}
+	if i < len(fields) && (fields[i] == "EDITIONABLE" || fields[i] == "NONEDITIONABLE") {
+		i++
+	}
+	if i >= len(fields) {
+		return false
+	}
+	switch fields[i] {
+	case "TRIGGER", "PROCEDURE", "FUNCTION", "PACKAGE", "TYPE":
+		return true
+	default:
+		return false
+	}
+}
+
+// standaloneSlash reports whether script[i] is the only non-whitespace byte
+// on its line, matching SQL*Plus' block execution delimiter.
+func standaloneSlash(script string, i int) bool {
+	for j := i - 1; j >= 0 && script[j] != '\n' && script[j] != '\r'; j-- {
+		if script[j] != ' ' && script[j] != '\t' {
+			return false
+		}
+	}
+	for j := i + 1; j < len(script) && script[j] != '\n' && script[j] != '\r'; j++ {
+		if script[j] != ' ' && script[j] != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 // RouteStatement decides whether a single statement should be sent
