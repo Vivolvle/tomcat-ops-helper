@@ -917,3 +917,62 @@ func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) 
 	}
 	return mustMarshal(data), nil
 }
+
+// UploadGuideData is the JSON returned by the "upload_guide" action.
+type UploadGuideData struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	ServerURL   string `json:"server_url"`
+	Steps       []string `json:"steps"`
+}
+
+// uploadGuide returns step-by-step instructions for uploading a file.
+func (r *Registry) uploadGuide(params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+	source, err := requireString(p, "source")
+	if err != nil {
+		return nil, fmt.Errorf("upload_guide: %w", err)
+	}
+	dest, err := requireString(p, "destination")
+	if err != nil {
+		return nil, fmt.Errorf("upload_guide: %w", err)
+	}
+
+	// Use the server_url from config to derive the upload endpoint.
+	// Default to localhost:7777 if not available.
+	serverURL := "http://127.0.0.1:7777"
+	if r.cfg.ServerURL != "" {
+		// Extract host:port from server_url (e.g., "wss://example.com:8443" -> "http://example.com:7777")
+		serverURL = r.cfg.ServerURL
+		// Convert wss:// to http://
+		serverURL = strings.Replace(serverURL, "wss://", "http://", 1)
+		serverURL = strings.Replace(serverURL, "ws://", "http://", 1)
+		// Replace the port with 7777 (agent HTTP bridge)
+		if idx := strings.LastIndex(serverURL, ":"); idx > 0 {
+			serverURL = serverURL[:idx] + ":7777"
+		}
+	}
+
+	steps := []string{
+		"1. Use bash tool to compute SHA256 hash:",
+		fmt.Sprintf("   $sha = (Get-FileHash '%s' -Algorithm SHA256).Hash.ToLower()", source),
+		"",
+		"2. Use bash tool to upload via curl:",
+		fmt.Sprintf("   curl.exe -k -X POST -F 'file=@%s' -F 'path=%s' -F 'sha256=$sha' -F 'overwrite=true' %s/upload", source, dest, serverURL),
+		"",
+		"3. The upload endpoint returns JSON with 'upload_id', 'bytes', 'duration_ms', and 'result' (containing sha256, verified, overwritten).",
+		"",
+		"IMPORTANT: This tool only provides instructions. You must use bash tool to execute the commands above.",
+	}
+
+	data := UploadGuideData{
+		Source:      source,
+		Destination: dest,
+		ServerURL:   serverURL,
+		Steps:       steps,
+	}
+	return mustMarshal(data), nil
+}

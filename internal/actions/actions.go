@@ -122,6 +122,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.cancelUpload(params)
 	case "validate_config":
 		return r.validateConfig(ctx)
+	case "upload_guide":
+		return r.uploadGuide(params)
 	case "esb_db_operator", "erp_db_operator":
 		return r.dbOperator(ctx, name, params)
 	default:

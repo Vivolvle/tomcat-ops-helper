@@ -89,6 +89,11 @@ func coreTools() []Tool {
 			Description: "Return what helper actually loaded: tomcat_home / jdk_home / log_dir existence, every allowed_dirs entry with existence check, and a per-connector health snapshot (Open / Driver / Host / Port / Database / LatencyMs / LastError). Connectors that were never wired in (esb / erp blocks missing from config.json) are omitted. Passwords are never returned. Use after editing config.json and restarting helper to confirm changes took effect.",
 			InputSchema: emptyObjectSchema,
 		},
+		{
+			Name:        "upload_guide",
+			Description: "Return step-by-step instructions for uploading a file from the operator machine to the helper. This is a documentation tool - it does NOT perform the upload, it tells the agent HOW to do it via bash + curl. Use this when you need to upload a file but don't know the upload procedure.",
+			InputSchema: uploadGuideSchema,
+		},
 	}
 }
 
@@ -168,12 +173,22 @@ var writeFileSchema = json.RawMessage(`{
 }`)
 
 var appendTextFileSchema = json.RawMessage(`{
-	"type":"object",
+	"type": "object",
 	"properties":{
 		"path":{"type":"string","description":"Absolute destination path; its parent must be under allowed_dirs."},
 		"text":{"type":"string","description":"UTF-8 text appended exactly; no BOM or newline is added automatically."}
 	},
 	"required":["path","text"],
+	"additionalProperties":false
+}`)
+
+var uploadGuideSchema = json.RawMessage(`{
+	"type": "object",
+	"properties":{
+		"source":{"type":"string","description":"Local file path on the operator machine to upload."},
+		"destination":{"type":"string","description":"Absolute destination path on the helper machine (must be under allowed_dirs)."}
+	},
+	"required":["source","destination"],
 	"additionalProperties":false
 }`)
 
