@@ -367,6 +367,8 @@ advertised in its `ToolList`. To ship a new capability:
 5. **Rebuild helper only**: `go build -ldflags="-s -w" -o bin\helper.exe .\cmd\helper`.
    Server is unchanged; it will pick up the new ToolList the next time the
    helper reconnects (or just bounce helper in place).
+6. **Sync staging dir**: `Copy-Item -Force .\bin\helper.exe D:\tools\helper-client\helper.exe`
+   and verify sha256 matches. This directory is what gets handed to the customer box.
 
 If you accidentally edit server code thinking a new helper tool belongs
 there — undo that. The server has no per-helper-tool logic; it only relays.

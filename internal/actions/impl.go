@@ -923,6 +923,7 @@ type UploadGuideData struct {
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 	ServerURL   string `json:"server_url"`
+	ClientID    string `json:"client_id,omitempty"`
 	Steps       []string `json:"steps"`
 }
 
@@ -956,12 +957,20 @@ func (r *Registry) uploadGuide(params json.RawMessage) (json.RawMessage, error) 
 		}
 	}
 
+	clientID := r.cfg.ClientID
+
+	// Build curl flags; include client_id when available.
+	curlFlags := fmt.Sprintf("-F 'file=@%s' -F 'path=%s' -F 'sha256=$sha' -F 'overwrite=true'", source, dest)
+	if clientID != "" {
+		curlFlags += fmt.Sprintf(" -F 'client_id=%s'", clientID)
+	}
+
 	steps := []string{
 		"1. Use bash tool to compute SHA256 hash:",
 		fmt.Sprintf("   $sha = (Get-FileHash '%s' -Algorithm SHA256).Hash.ToLower()", source),
 		"",
 		"2. Use bash tool to upload via curl:",
-		fmt.Sprintf("   curl.exe -k -X POST -F 'file=@%s' -F 'path=%s' -F 'sha256=$sha' -F 'overwrite=true' %s/upload", source, dest, serverURL),
+		fmt.Sprintf("   curl.exe -k -X POST %s %s/upload", curlFlags, serverURL),
 		"",
 		"3. The upload endpoint returns JSON with 'upload_id', 'bytes', 'duration_ms', and 'result' (containing sha256, verified, overwritten).",
 		"",
@@ -972,6 +981,7 @@ func (r *Registry) uploadGuide(params json.RawMessage) (json.RawMessage, error) 
 		Source:      source,
 		Destination: dest,
 		ServerURL:   serverURL,
+		ClientID:    clientID,
 		Steps:       steps,
 	}
 	return mustMarshal(data), nil
