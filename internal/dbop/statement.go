@@ -149,16 +149,12 @@ func splitScript(script string, oraclePLSQL bool) []string {
 				i = j + 2
 				continue
 			case inPLSQL && c == '/' && standaloneSlash(script, i):
-				if stmt := strings.TrimSpace(cur.String()); stmt != "" {
-					out = append(out, stmt)
-				}
-				cur.Reset()
+				flushCur(&out, &cur, oraclePLSQL, inPLSQL)
 				inPLSQL = false
 				i++
 				continue
 			case c == ';' && !inPLSQL:
-				out = append(out, cur.String())
-				cur.Reset()
+				flushCur(&out, &cur, oraclePLSQL, inPLSQL)
 				i++
 				continue
 			}
@@ -166,10 +162,32 @@ func splitScript(script string, oraclePLSQL bool) []string {
 			i++
 		}
 	}
-	if tail := strings.TrimSpace(cur.String()); tail != "" {
-		out = append(out, cur.String())
-	}
+	flushCur(&out, &cur, oraclePLSQL, inPLSQL)
 	return out
+}
+
+// flushCur appends the accumulated buffer to out (after stripping
+// trailing whitespace only — leading comments ride along so the audit
+// log records what the operator actually wrote, and trimStatement in
+// dbop.go takes care of cleaning them up for the driver) and resets
+// the buffer.
+//
+// For Oracle PL/SQL blocks we additionally append a trailing NUL byte
+// as a sentinel. trimStatement strips it and treats the statement as
+// "preserve the trailing ';'", which is what PL/SQL requires ("END;"
+// must stay "END;", otherwise USER_SOURCE stores "END" and the block
+// fails to compile with PLS-00103). See problem.md 2026-09-21.
+func flushCur(out *[]string, cur *strings.Builder, oraclePLSQL, inPLSQL bool) {
+	raw := strings.TrimRight(cur.String(), " \t\r\n")
+	cur.Reset()
+	if raw == "" {
+		return
+	}
+	if oraclePLSQL && inPLSQL {
+		*out = append(*out, raw+"\x00")
+		return
+	}
+	*out = append(*out, raw)
 }
 
 func looksLikeOraclePLSQLStart(s string) bool {

@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -257,6 +258,17 @@ func trimStatement(s string) string {
 	// Collapse interior whitespace.
 	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r') {
 		s = s[1:]
+	}
+	// NUL sentinel emitted by SplitScriptForDriver for Oracle PL/SQL
+	// blocks: strip it, then trim trailing whitespace only, leaving
+	// the block's closing ';' intact ("END;" must not become "END").
+	// See problem.md 2026-09-21.
+	if strings.HasSuffix(s, "\x00") {
+		s = s[:len(s)-1]
+		for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
+			s = s[:len(s)-1]
+		}
+		return s
 	}
 	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r' || s[len(s)-1] == ';') {
 		s = s[:len(s)-1]

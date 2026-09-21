@@ -124,11 +124,25 @@ SELECT 1 FROM DUAL;`
 	if len(got) != 2 {
 		t.Fatalf("expected trigger + select, got %d: %#v", len(got), got)
 	}
-	if !strings.Contains(got[0], ":NEW.ID := SEQ_ESB_EVENT.NEXTVAL;") || !strings.HasSuffix(got[0], "END;") {
-		t.Fatalf("PL/SQL block was split or changed: %q", got[0])
+	if !strings.Contains(got[0], ":NEW.ID := SEQ_ESB_EVENT.NEXTVAL;") {
+		t.Fatalf("PL/SQL block body lost: %q", got[0])
+	}
+	if got := TrimStatement(got[0]); !strings.HasSuffix(got, "END;") {
+		t.Fatalf("TrimStatement must preserve the closing ';': %q", got)
 	}
 	if strings.Contains(got[0], "\n/") || strings.TrimSpace(got[1]) != "SELECT 1 FROM DUAL" {
 		t.Fatalf("SQL*Plus slash was not removed cleanly: %#v", got)
+	}
+	// SplitScript marks Oracle PL/SQL blocks with a trailing NUL so that
+	// trimStatement in dbop.go can tell them apart from ordinary
+	// statements and stop stripping the closing ';'. See problem.md
+	// 2026-09-21 — trimming it here would regress the regression test
+	// TestRunScript_OraclePLSQLKeepsTrailingSemicolon below.
+	if !strings.HasSuffix(got[0], "\x00") {
+		t.Fatalf("PL/SQL block must be tagged with the trim sentinel: %q", got[0])
+	}
+	if got := TrimStatement(got[0]); !strings.HasSuffix(got, "END;") {
+		t.Fatalf("TrimStatement must preserve the closing ';': %q", got)
 	}
 }
 
@@ -138,8 +152,11 @@ func TestSplitScriptForDriver_OracleAnonymousBlockWithoutSlash(t *testing.T) {
   UPDATE t SET id = 2 WHERE id = 1;
 END;`
 	got := SplitScriptForDriver(script, "oracle")
-	if len(got) != 1 || strings.TrimSpace(got[0]) != script {
+	if len(got) != 1 {
 		t.Fatalf("anonymous block should remain one statement: %#v", got)
+	}
+	if got := TrimStatement(got[0]); strings.TrimSpace(got) != script {
+		t.Fatalf("anonymous block should round-trip through TrimStatement: got TrimStatement=%q", got)
 	}
 }
 
@@ -164,6 +181,71 @@ func TestRunScript_OraclePLSQLExecutesOnce(t *testing.T) {
 	res := RunScript(context.Background(), op, script, 10, time.Second, time.Second)
 	if res.FirstError != "" || op.ExecCount != 1 || len(res.Statements) != 1 {
 		t.Fatalf("PL/SQL block should execute exactly once: result=%+v calls=%+v", res, op.Calls)
+	}
+}
+
+// Regression for problem.md 2026-09-21: SplitScript + trimStatement used
+// to strip the closing ';' of Oracle PL/SQL blocks ("END;" -> "END"),
+// which made USER_SOURCE store invalid source and broke compilation
+// with PLS-00103 even though STATUS showed ENABLED.
+func TestRunScript_OraclePLSQLKeepsTrailingSemicolon(t *testing.T) {
+	var received string
+	op := &FakeOp{
+		Driver: "oracle",
+		ExecHandler: func(_ context.Context, sql string) (ExecResult, error) {
+			received = sql
+			return ExecResult{}, nil
+		},
+	}
+	script := "-- register customer-changed event trigger\n" +
+		"CREATE OR REPLACE TRIGGER TRG_ESB_CUSTOMER_CHANGED\n" +
+		"BEFORE UPDATE ON CUSTOMER FOR EACH ROW\n" +
+		"BEGIN\n" +
+		"  INSERT INTO ESB_EVENT (TYPE) VALUES ('CUSTOMER_CHANGED');\n" +
+		"END;\n" +
+		"/\n"
+	res := RunScript(context.Background(), op, script, 10, time.Second, time.Second)
+	if res.FirstError != "" {
+		t.Fatalf("unexpected error: %s", res.FirstError)
+	}
+	if op.ExecCount != 1 {
+		t.Fatalf("expected exactly 1 exec, got %d", op.ExecCount)
+	}
+	if strings.Contains(received, "\n/") {
+		t.Fatalf("SQL*Plus slash must not reach the driver: %q", received)
+	}
+	if !strings.HasSuffix(strings.TrimRight(received, " \t\r\n"), "END;") {
+		t.Fatalf("PL/SQL block must keep its closing ';' (USER_SOURCE stores this verbatim);\n got: %q", received)
+	}
+	if !strings.HasPrefix(received, "CREATE OR REPLACE TRIGGER") {
+		t.Fatalf("leading comments should be stripped, got: %q", received)
+	}
+	if !strings.Contains(received, "INSERT INTO ESB_EVENT") {
+		t.Fatalf("block body lost: %q", received)
+	}
+}
+
+// Same regression but for anonymous PL/SQL blocks (BEGIN ... END;)
+// without a SQL*Plus '/' — they must still keep the closing ';'.
+func TestRunScript_OracleAnonymousBlockKeepsTrailingSemicolon(t *testing.T) {
+	var received string
+	op := &FakeOp{
+		Driver: "oracle",
+		ExecHandler: func(_ context.Context, sql string) (ExecResult, error) {
+			received = sql
+			return ExecResult{}, nil
+		},
+	}
+	script := "BEGIN\n  UPDATE t SET flag = 1 WHERE id = 42;\n  COMMIT;\nEND;\n"
+	res := RunScript(context.Background(), op, script, 10, time.Second, time.Second)
+	if res.FirstError != "" {
+		t.Fatalf("unexpected error: %s", res.FirstError)
+	}
+	if op.ExecCount != 1 {
+		t.Fatalf("expected exactly 1 exec, got %d", op.ExecCount)
+	}
+	if !strings.HasSuffix(strings.TrimRight(received, " \t\r\n"), "END;") {
+		t.Fatalf("anonymous block must keep its closing ';';\n got: %q", received)
 	}
 }
 
