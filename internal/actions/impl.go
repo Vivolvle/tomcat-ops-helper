@@ -73,6 +73,13 @@ func isInteresting(p JavaProcess, tomcatHome string) bool {
 	if strings.Contains(lc, "catalina") {
 		return true
 	}
+	// Also check for Tomcat's main class and common JVM arguments
+	if strings.Contains(lc, "org.apache.catalina.startup.bootstrap") {
+		return true
+	}
+	if strings.Contains(lc, "-Dcatalina.home=") || strings.Contains(lc, "-Dcatalina.base=") {
+		return true
+	}
 	if tomcatHome != "" && strings.Contains(lc, strings.ToLower(filepath.ToSlash(tomcatHome))) {
 		return true
 	}
@@ -265,6 +272,11 @@ func (r *Registry) restartWindowsService(ctx context.Context, serviceName string
 	if err := r.waitServiceState(stopCtx, serviceName, "STOPPED"); err != nil {
 		return data, true, fmt.Errorf("restart: service %s was not stopped within %s; consider taskkill /F /PID after checking sc queryex %s: %w", serviceName, timeout, serviceName, err)
 	}
+	
+	// Wait for catalina processes to actually exit after service stops
+	if err := r.waitForCatalinaExit(stopCtx); err != nil {
+		return data, true, fmt.Errorf("restart: catalina processes did not exit after service stop: %w", err)
+	}
 
 	startCtx, startCancel := context.WithTimeout(ctx, timeout)
 	defer startCancel()
@@ -296,6 +308,41 @@ func (r *Registry) waitServiceState(ctx context.Context, serviceName, wanted str
 	}
 }
 
+// waitForCatalinaExit waits for all catalina-related Java processes to exit.
+// This addresses the issue where service stops but catalina processes remain running.
+func (r *Registry) waitForCatalinaExit(ctx context.Context) error {
+	// Poll for up to 30 seconds, checking every second
+	pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	
+	for {
+		procs, err := r.probe.JavaProcesses(pollCtx)
+		if err != nil {
+			return err
+		}
+		
+		// Check if any catalina processes are still running
+		found := false
+		for _, p := range procs {
+			if isInteresting(p, r.cfg.TomcatHome) {
+				found = true
+				break
+			}
+		}
+		
+		if !found {
+			return nil // All catalina processes have exited
+		}
+		
+		select {
+		case <-pollCtx.Done():
+			return fmt.Errorf("catalina processes still running after timeout")
+		case <-time.After(time.Second):
+			// Continue polling
+		}
+	}
+}
+
 func resultMessage(res execshell.Result, err error) string {
 	if err != nil {
 		return err.Error()
@@ -320,11 +367,13 @@ func binQuote(p string, goos string) string {
 
 // ReplaceJarData is the JSON returned by "replace_jar".
 type ReplaceJarData struct {
-	Source    string `json:"source"`
-	Dest      string `json:"dest"`
-	SHA256    string `json:"sha256"`
-	Bytes     int64  `json:"bytes"`
-	Restarted bool   `json:"restarted,omitempty"`
+	Source      string          `json:"source"`
+	Dest        string          `json:"dest"`
+	SHA256      string          `json:"sha256"`
+	Bytes       int64           `json:"bytes"`
+	Restarted   bool            `json:"restarted,omitempty"`
+	RestartData *RestartData    `json:"restart_data,omitempty"`
+	RestartErr  string          `json:"restart_error,omitempty"`
 }
 
 func (r *Registry) replaceJar(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -378,11 +427,16 @@ func (r *Registry) replaceJar(ctx context.Context, params json.RawMessage) (json
 	}
 	data := ReplaceJarData{Source: srcAbs, Dest: dstAbs, SHA256: sum, Bytes: st.Size()}
 	if v, ok := p["restart"].(bool); ok && v {
-		raw, _ := r.restart(ctx, mustMarshal(map[string]any{"timeout": float64(r.cfg.CommandTimeout.Seconds())}))
+		raw, err := r.restart(ctx, mustMarshal(map[string]any{"timeout": float64(r.cfg.CommandTimeout.Seconds())}))
 		data.Restarted = true
-		// Discard restart detail from response; the action that called us gets
-		// the raw restart payload already.
-		_ = raw
+		if err != nil {
+			data.RestartErr = err.Error()
+		} else if raw != nil {
+			var restartData RestartData
+			if jsonErr := json.Unmarshal(raw, &restartData); jsonErr == nil {
+				data.RestartData = &restartData
+			}
+		}
 	}
 	return mustMarshal(data), nil
 }

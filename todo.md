@@ -8,6 +8,60 @@
 
 ---
 
+# 2026-09-22 问题修复（来自 yc-esb agent 反馈）
+
+## 问题 1：replace_jar(restart=true) 整体 timeout，调用方拿不到 jar 是否落盘的反馈
+
+**修复**：改进 `replace_jar` 返回结构，现在包含 `restart_data` 和 `restart_error` 字段。
+- `RestartData` 包含 shutdown/startup 的详细结果
+- `RestartErr` 包含 restart 过程中的错误信息
+- 即使 restart 失败或 timeout，copy 的结果（source, dest, sha256, bytes）仍然返回
+
+**文件**：`internal/actions/impl.go:321-388`
+
+## 问题 2：restart() 触发后，旧 catalina 进程没真正退出，导致两个 catalina 并存
+
+**修复**：在 `restartWindowsService` 中添加 `waitForCatalinaExit` 方法。
+- 服务停止后，轮询检查 catalina 相关 Java 进程是否退出
+- 最长等待 30 秒，每秒检查一次
+- 使用 `isInteresting` 过滤器识别 catalina 进程
+
+**文件**：`internal/actions/impl.go:247-320`
+
+## 问题 3：kill_zombie pid=15168 找不到、status 里 java_processes 一直是 null
+
+**修复**：改进 `isInteresting` 函数，扩展识别范围。
+- 添加对 `org.apache.catalina.startup.bootstrap` 的识别（Tomcat 主类）
+- 添加对 `-Dcatalina.home=` 和 `-Dcatalina.base=` JVM 参数的识别
+- 这些参数在 procrun 启动的 Tomcat 进程中常见
+
+**文件**：`internal/actions/impl.go:68-80`
+
+## 测试结果
+
+```
+ok  	tomcat-ops-helper/cmd/helper
+ok  	tomcat-ops-helper/cmd/mcpstdio
+ok  	tomcat-ops-helper/cmd/server
+ok  	tomcat-ops-helper/internal/actions
+ok  	tomcat-ops-helper/internal/config
+ok  	tomcat-ops-helper/internal/dbop
+ok  	tomcat-ops-helper/internal/execshell
+ok  	tomcat-ops-helper/internal/protocol
+ok  	tomcat-ops-helper/internal/wsclient
+ok  	tomcat-ops-helper/internal/wsserver
+```
+
+所有测试通过，`go vet` 无警告。
+
+## 构建与部署
+
+- `bin\helper.exe` 已重建（2026-09-22）
+- 已同步到 `D:\tools\helper-client\helper.exe`
+- sha256: `66D4832563AA87E2A17B1BE1872F9946AF0F2826D9809CCEB103FADC4CE3CDEE`
+
+---
+
 
 - [2026-09-12] **新增 `upload_file` 大文件传输（jar/war 部署）** —— **已实现**。
   - **协议层**：所有 chunk 状态都在 `Command.Params`（`UploadParams` JSON）里，没污染 `Envelope`，其他消息类型完全不受影响
