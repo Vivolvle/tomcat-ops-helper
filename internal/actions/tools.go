@@ -34,6 +34,9 @@ func (r *Registry) Tools() []Tool {
 // coreTools is the static, always-present tool list.
 func coreTools() []Tool {
 	return []Tool{
+		{Name: "list_exec", Description: "List currently running helper shell commands with PID, arguments, working directory and start time. Use kill_pid to stop a command.", InputSchema: emptyObjectSchema},
+		{Name: "read_file", Description: "Read an existing UTF-8 text file in allowed_dirs, up to 1 MiB. Returns exact text and SHA256. Local editor tools cannot read remote helper files.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`)},
+		{Name: "replace_text", Description: "Atomically replace literal text in an existing UTF-8 file in allowed_dirs, up to 1 MiB. Preserves BOM and line endings. Default expected_count=1; mismatch leaves file unchanged. Optional expected_sha256 checks the version read earlier.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"expected_count":{"type":"integer","minimum":1},"expected_sha256":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}`)},
 		{
 			Name:        "status",
 			Description: "Return hostname, OS, Tomcat home existence, JVM processes (filtered to Tomcat/catalina), and listening TCP ports.",
@@ -85,13 +88,18 @@ func coreTools() []Tool {
 			InputSchema: killZombieSchema,
 		},
 		{
+			Name:        "kill_pid",
+			Description: "Terminate any process by exact PID. On Windows, tree defaults true and uses taskkill /T; force defaults true. Refuses to terminate the helper process itself. Use this for non-Tomcat processes such as a foreground redis-server left behind by exec.",
+			InputSchema: killPIDSchema,
+		},
+		{
 			Name:        "regen_service",
 			Description: "Regenerate service.sh (Unix) or service.bat (Windows) under tomcat_home/bin from cfg.",
 			InputSchema: emptyObjectSchema,
 		},
 		{
 			Name:        "exec",
-			Description: "Run a single shell command with blacklist and allowed_dirs enforcement, output capped at cfg.max_output_size. Default shell is cmd.exe /C on Windows or sh -c on Unix; double-quoted arguments survive verbatim (paths with spaces are safe). For PowerShell cmdlets pass \"shell\":\"powershell\" to run the command as an encoded PowerShell script. Shell redirect/pipes (2>&1, |, &, ;) are NOT supported by exec; for multi-step scripts write a .cmd/.ps1 file via write_file and run that. Use sparingly; prefer named actions.",
+			Description: "Run a single shell command with blacklist and allowed_dirs enforcement, output capped at cfg.max_output_size. Commands may run concurrently. On Windows a timeout terminates the complete child process tree and releases inherited output handles. Default shell is cmd.exe /C on Windows or sh -c on Unix; double-quoted arguments survive verbatim (paths with spaces are safe). For PowerShell cmdlets pass \"shell\":\"powershell\" to run the command as an encoded PowerShell script. For an intentional service/background process, use its service manager or a detached launcher; use kill_pid for a leftover process. Shell redirect/pipes (2>&1, |, &, ;) are NOT supported by exec; for multi-step scripts write a .cmd/.ps1 file via write_file and run that. Use sparingly; prefer named actions.",
 			InputSchema: execSchema,
 		},
 		{
@@ -209,13 +217,24 @@ var killZombieSchema = json.RawMessage(`{
 	"additionalProperties":false
 }`)
 
+var killPIDSchema = json.RawMessage(`{
+	"type":"object",
+	"properties":{
+		"pid":{"type":"integer","description":"Exact process ID to terminate.","minimum":1},
+		"force":{"type":"boolean","description":"Force termination. Defaults true."},
+		"tree":{"type":"boolean","description":"Windows: also terminate child processes. Defaults true; ignored on other platforms."}
+	},
+	"required":["pid"],
+	"additionalProperties":false
+}`)
+
 var execSchema = json.RawMessage(`{
 	"type":"object",
 	"properties":{
 		"cmd":{"type":"string","description":"Shell command. Runs through cmd.exe /C on Windows or sh -c on Unix."},
 		"work_dir":{"type":"string","description":"Working directory; must be under allowed_dirs. Defaults to cfg.tomcat_home; if that is missing or not allowed, the first existing allowed_dirs entry is used and reported back as work_dir with work_dir_fallback=true."},
 		"shell":{"type":"string","enum":["powershell","pwsh","cmd","sh"],"description":"Optional shell override. 'powershell' or 'pwsh' wraps the command in powershell -NoProfile -NonInteractive -Command with a Set-Location prologue so paths with spaces and PowerShell-specific syntax work without the cmd /C tokenize quirks. Default is cmd /C on Windows, sh -c on Unix."},
-		"timeout":{"type":"integer","description":"Per-command timeout in seconds. Defaults to cfg.command_timeout (30s). Increase for slow commands like net stop or large file extraction.","minimum":1}
+		"timeout":{"type":"integer","description":"Per-command timeout in seconds. Defaults to cfg.command_timeout (30s). On Windows, expiry terminates the full spawned process tree. Increase for slow commands like net stop or large file extraction.","minimum":1}
 	},
 	"required":["cmd"],
 	"additionalProperties":false

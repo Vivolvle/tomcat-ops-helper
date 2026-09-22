@@ -3,10 +3,15 @@
 package execshell
 
 import (
+	"context"
+	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // configureCmdLine makes the Windows runner hand the command string to
@@ -28,6 +33,31 @@ func configureCmdLine(cmd *exec.Cmd, name string, args []string) {
 		return
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: `/d /s /c "` + args[1] + `"`}
+}
+
+// configureCancellation makes a context timeout terminate the whole Windows
+// process tree. Killing cmd.exe alone leaves grandchildren such as
+// redis-server.exe alive, and inherited stdout/stderr handles can then keep
+// Cmd.Wait blocked forever. WaitDelay is the final guard against leaked pipe
+// handles from a process taskkill could not reach.
+func configureCancellation(cmd *exec.Cmd) {
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		killCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := exec.CommandContext(killCtx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		if err == nil {
+			return nil
+		}
+		fallbackErr := cmd.Process.Kill()
+		if errors.Is(fallbackErr, os.ErrProcessDone) {
+			return os.ErrProcessDone
+		}
+		return fallbackErr
+	}
 }
 
 func isCmdExe(name string) bool {

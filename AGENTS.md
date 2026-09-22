@@ -151,6 +151,11 @@ function instead of writing to disk.
 - Token in `config.json` **must match** a token in `server.json`'s `tokens[]`.
 - Helper logs go to stdout and to `helper.log` (audit). Server writes
   `audit.log` JSONL.
+- `exec` calls are independent and may run concurrently. On Windows, context
+  timeout runs `taskkill /T /F` against the spawned command and bounds pipe
+  cleanup, so a foreground daemon cannot block later exec calls. Use
+  `kill_pid` for an arbitrary leftover PID; it defaults to killing the process
+  tree and refuses to kill helper itself.
 - Database writes run in an explicit per-statement transaction. Do not put
   standalone transaction-control `BEGIN` / `COMMIT` / `ROLLBACK` into dbop scripts. Read queries may retry
   once after a stale connection; writes are deliberately never replayed
@@ -225,6 +230,24 @@ go build -ldflags="-s -w" -o bin\mcpstdio.exe .\cmd\mcpstdio
 ```
 
 ## Writing files via MCP (recipes that actually work)
+
+Remote text files can be read with `read_file {path}` and edited with
+`replace_text {path, old_text, new_text}`. Both enforce allowed_dirs and accept
+UTF-8 files up to 1 MiB. Replacement is literal and atomic, preserves BOM/CRLF,
+and requires exactly one match by default. Set `expected_count` explicitly for
+multiple matches; pass `expected_sha256` from read_file to reject stale edits.
+Local Read/Edit tools operate on the operator machine, not the remote helper.
+
+Use `list_exec` to inspect active commands and their PIDs, then `kill_pid` to
+stop one. The configured total timeout terminates Windows process trees even
+when they produce no output; output silence alone is not considered a hang.
+Nonzero exec results include `error_summary` as well as stdout/stderr.
+Procrun switches such as `//IS//name`, `//RS//name` and `//DS//name` are not paths.
+Quote paths with spaces and pass `work_dir` explicitly when needed. Both `rd`
+and `rmdir` recursive deletion remain blocked, including reversed /Q /S flags.
+For PowerShell use `shell: powershell` (EncodedCommand), or write a .ps1 and
+invoke `powershell -NoProfile -File "path"`; avoid nesting -Command quotes in cmd.
+After deployment, restart the customer helper to receive these new tools.
 
 For **text** files (configs, scripts, notes) use the `write_file` named
 action — it's atomic, no-BOM, no cmd.exe pain:

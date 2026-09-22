@@ -116,10 +116,18 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.replaceJar(ctx, params)
 	case "kill_zombie":
 		return r.killZombie(ctx, params)
+	case "kill_pid":
+		return r.killProcess(ctx, params)
 	case "regen_service":
 		return r.regenService(params)
 	case "exec":
 		return r.execAction(ctx, params)
+	case "list_exec":
+		return mustMarshal(map[string]any{"commands": r.executor.Running()}), nil
+	case "read_file":
+		return r.textFile(params, false)
+	case "replace_text":
+		return r.textFile(params, true)
 	case "write_file":
 		return r.writeFile(params)
 	case "append_text_file":
@@ -161,6 +169,9 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 	if s, _ := p["shell"].(string); s != "" {
 		switch strings.ToLower(s) {
 		case "powershell", "pwsh":
+			if pattern, hit := execshell.IsBlacklisted(cmdStr); hit {
+				return nil, fmt.Errorf("%w: %s", execshell.ErrBlacklisted, pattern)
+			}
 			// The wrapper base64-encodes the command, so Executor.Exec's
 			// path scan can no longer see the paths inside it. Run the
 			// guard rail on the original text before wrapping.
@@ -199,6 +210,17 @@ func (r *Registry) execAction(ctx context.Context, params json.RawMessage) (json
 		// running somewhere other than cfg.tomcat_home (todo G1②).
 		fields["work_dir_fallback"] = true
 		fields["work_dir_default"] = fallbackFrom
+	}
+	if out.ExitCode != 0 {
+		summary := strings.TrimSpace(out.Stderr)
+		if summary == "" {
+			summary = strings.TrimSpace(out.Stdout)
+		}
+		runes := []rune(summary)
+		if len(runes) > 1000 {
+			summary = string(runes[:1000]) + "…"
+		}
+		fields["error_summary"] = fmt.Sprintf("exit_code=%d: %s", out.ExitCode, summary)
 	}
 	data := mustMarshal(fields)
 	if err != nil {

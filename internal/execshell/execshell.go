@@ -25,10 +25,10 @@ type Runner interface {
 
 // Result captures everything we care about from a single invocation.
 type Result struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int
-	Took     time.Duration
+	Stdout    string
+	Stderr    string
+	ExitCode  int
+	Took      time.Duration
 	Truncated bool
 }
 
@@ -37,14 +37,14 @@ type Auditor func(entry AuditEntry)
 
 // AuditEntry is what an Auditor typically serialises.
 type AuditEntry struct {
-	Timestamp  time.Time `json:"timestamp"`
-	Cmd        string    `json:"cmd"`
-	WorkDir    string    `json:"work_dir"`
-	ExitCode   int       `json:"exit_code"`
-	TookMs     int64     `json:"took_ms"`
-	OutputBytes int      `json:"output_bytes"`
-	Truncated  bool      `json:"truncated"`
-	Error      string    `json:"error,omitempty"`
+	Timestamp   time.Time `json:"timestamp"`
+	Cmd         string    `json:"cmd"`
+	WorkDir     string    `json:"work_dir"`
+	ExitCode    int       `json:"exit_code"`
+	TookMs      int64     `json:"took_ms"`
+	OutputBytes int       `json:"output_bytes"`
+	Truncated   bool      `json:"truncated"`
+	Error       string    `json:"error,omitempty"`
 }
 
 // blacklist contains patterns we refuse to run regardless of context.
@@ -55,7 +55,7 @@ var blacklist = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bcurl\b[^\n|]*\|\s*bash\b`),
 	regexp.MustCompile(`(?i)\bwget\b[^\n|]*\|\s*bash\b`),
 	regexp.MustCompile(`(?i)\bdel\s+/f\s+/s\s+/q\s+([a-zA-Z]:\\|\\)`),
-	regexp.MustCompile(`(?i)\brd\s+/s\s+/q\s+([a-zA-Z]:\\|\\)`),
+	regexp.MustCompile(`(?i)\b(?:rd|rmdir)(?:\.exe)?\s+(?:/q\s+)?/s\b`),
 	regexp.MustCompile(`(?i)\bnet\s+user\b`),
 	regexp.MustCompile(`(?i)\bnet\s+localgroup\b`),
 	regexp.MustCompile(`(?i)\breg\s+delete\b`),
@@ -90,6 +90,13 @@ func IsBlacklisted(cmd string) (string, bool) {
 //   - POSIX-style absolute path with at least two segments: `/foo/bar`
 //     (a single-segment `/S` is a cmd.exe switch, not a path)
 func ExtractPaths(cmd string) []string {
+	// cmd /C adds an outer pair around an already quoted command line.
+	// Remove only that wrapper before scanning the inner path quotes.
+	if m := regexp.MustCompile(`(?is)^\s*cmd(?:\.exe)?\s+/(?:c|k)\s+"(.*)"\s*$`).FindStringSubmatch(cmd); m != nil {
+		return ExtractPaths(m[1])
+	}
+	// PowerShell literal strings also protect spaces in paths.
+	cmd = strings.ReplaceAll(cmd, "'", `"`)
 	out := []string{}
 	seen := map[string]bool{}
 	add := func(tok string) {
@@ -126,7 +133,7 @@ func ExtractPaths(cmd string) []string {
 func CheckAllowedPaths(cfg *config.HelperConfig, cmd string) error {
 	for _, p := range ExtractPaths(cmd) {
 		if !cfg.IsAllowedWorkDir(p) {
-			return fmt.Errorf("%w: %s", ErrWorkDirNotAllowed, p)
+			return fmt.Errorf("%w: %s (must be inside allowed_dirs)", ErrCommandPathNotAllowed, p)
 		}
 	}
 	return nil
@@ -187,6 +194,9 @@ func splitTokens(s string) []string {
 
 // looksLikePath applies the rules described on ExtractPaths.
 func looksLikePath(tok string) bool {
+	if regexp.MustCompile(`(?i)^//(?:IS|RS|DS|MS|SS|US|TS|ES|PS|VS)//[^/\\\s]+$`).MatchString(tok) {
+		return false
+	}
 	// Drive-letter: C:\ or C:/
 	if len(tok) >= 3 && tok[1] == ':' && (tok[2] == '\\' || tok[2] == '/') {
 		return true
@@ -233,6 +243,8 @@ var ErrBlacklisted = errors.New("command blacklisted")
 
 // ErrWorkDirNotAllowed is returned when work_dir is outside AllowedDirs.
 var ErrWorkDirNotAllowed = errors.New("work dir not allowed")
+
+var ErrCommandPathNotAllowed = errors.New("command path not allowed")
 
 // ErrEmpty is returned for an empty command.
 var ErrEmpty = errors.New("empty command")

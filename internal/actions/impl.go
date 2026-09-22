@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -163,9 +164,9 @@ func (r *Registry) tail(params json.RawMessage) (json.RawMessage, error) {
 
 // StopServiceData is the JSON returned by "stop_service".
 type StopServiceData struct {
-	ServiceName string        `json:"service_name"`
+	ServiceName string           `json:"service_name"`
 	Stop        execshell.Result `json:"stop"`
-	Exited      bool          `json:"exited"` // true if catalina processes confirmed gone
+	Exited      bool             `json:"exited"` // true if catalina processes confirmed gone
 }
 
 func (r *Registry) stopService(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -243,9 +244,9 @@ func (r *Registry) waitForCatalinaExitWithTimeout(ctx context.Context, timeout t
 
 // StartServiceData is the JSON returned by "start_service".
 type StartServiceData struct {
-	ServiceName string        `json:"service_name"`
+	ServiceName string           `json:"service_name"`
 	Start       execshell.Result `json:"start"`
-	Running     bool          `json:"running"` // true if service confirmed RUNNING
+	Running     bool             `json:"running"` // true if service confirmed RUNNING
 }
 
 func (r *Registry) startService(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -279,7 +280,7 @@ func (r *Registry) startService(ctx context.Context, params json.RawMessage) (js
 type WaitCatalinaData struct {
 	ServiceName string `json:"service_name,omitempty"`
 	Wanted      string `json:"wanted"`
-	Exited      bool   `json:"exited"` // true if catalina processes gone
+	Exited      bool   `json:"exited"`  // true if catalina processes gone
 	Running     bool   `json:"running"` // true if catalina processes found
 	TimedOut    bool   `json:"timed_out"`
 }
@@ -334,12 +335,12 @@ func (r *Registry) waitCatalina(ctx context.Context, params json.RawMessage) (js
 
 // DeployData is the JSON returned by "deploy".
 type DeployData struct {
-	ServiceName    string         `json:"service_name,omitempty"`
-	StopResult     *StopServiceData `json:"stop_result,omitempty"`
-	ReplaceResult  *ReplaceJarData  `json:"replace_result,omitempty"`
-	StartResult    *StartServiceData  `json:"start_result,omitempty"`
-	Error          string         `json:"error,omitempty"`
-	Step           string         `json:"step"` // which step failed
+	ServiceName   string            `json:"service_name,omitempty"`
+	StopResult    *StopServiceData  `json:"stop_result,omitempty"`
+	ReplaceResult *ReplaceJarData   `json:"replace_result,omitempty"`
+	StartResult   *StartServiceData `json:"start_result,omitempty"`
+	Error         string            `json:"error,omitempty"`
+	Step          string            `json:"step"` // which step failed
 }
 
 func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -528,7 +529,7 @@ func (r *Registry) restartWindowsService(ctx context.Context, serviceName string
 	if err := r.waitServiceState(stopCtx, serviceName, "STOPPED"); err != nil {
 		return data, true, fmt.Errorf("restart: service %s was not stopped within %s; consider taskkill /F /PID after checking sc queryex %s: %w", serviceName, stopTimeout, serviceName, err)
 	}
-	
+
 	// Wait for catalina processes to actually exit after service stops
 	if err := r.waitForCatalinaExitWithTimeout(stopCtx, stopTimeout); err != nil {
 		// Non-fatal: catalina may linger but we can still try to start
@@ -594,13 +595,13 @@ func binQuote(p string, goos string) string {
 
 // ReplaceJarData is the JSON returned by "replace_jar".
 type ReplaceJarData struct {
-	Source      string          `json:"source"`
-	Dest        string          `json:"dest"`
-	SHA256      string          `json:"sha256"`
-	Bytes       int64           `json:"bytes"`
-	Restarted   bool            `json:"restarted,omitempty"`
-	RestartData *RestartData    `json:"restart_data,omitempty"`
-	RestartErr  string          `json:"restart_error,omitempty"`
+	Source      string       `json:"source"`
+	Dest        string       `json:"dest"`
+	SHA256      string       `json:"sha256"`
+	Bytes       int64        `json:"bytes"`
+	Restarted   bool         `json:"restarted,omitempty"`
+	RestartData *RestartData `json:"restart_data,omitempty"`
+	RestartErr  string       `json:"restart_error,omitempty"`
 }
 
 func (r *Registry) replaceJar(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -725,6 +726,65 @@ func killPID(ctx context.Context, pid int) error {
 		return exec.CommandContext(ctx, "taskkill", "/F", "/PID", fmt.Sprintf("%d", pid)).Run()
 	}
 	return exec.CommandContext(ctx, "kill", "-9", fmt.Sprintf("%d", pid)).Run()
+}
+
+// KillPIDData is returned by the general-purpose kill_pid action.
+type KillPIDData struct {
+	PID    int              `json:"pid"`
+	Force  bool             `json:"force"`
+	Tree   bool             `json:"tree"`
+	Result execshell.Result `json:"result"`
+}
+
+func (r *Registry) killProcess(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, fmt.Errorf("kill_pid: %w", err)
+	}
+	pidF, ok := p["pid"].(float64)
+	pid := int(pidF)
+	if !ok || pid < 1 || float64(pid) != pidF {
+		return nil, fmt.Errorf("kill_pid: pid must be a positive integer")
+	}
+	if pid == os.Getpid() {
+		return nil, fmt.Errorf("kill_pid: refusing to terminate the helper process itself (pid=%d)", pid)
+	}
+	force := true
+	if v, exists := p["force"].(bool); exists {
+		force = v
+	}
+	tree := runtime.GOOS == "windows"
+	if v, exists := p["tree"].(bool); exists {
+		tree = v
+	}
+
+	var cmd string
+	if runtime.GOOS == "windows" {
+		parts := []string{"taskkill"}
+		if tree {
+			parts = append(parts, "/T")
+		}
+		if force {
+			parts = append(parts, "/F")
+		}
+		parts = append(parts, "/PID", strconv.Itoa(pid))
+		cmd = strings.Join(parts, " ")
+	} else {
+		signal := "-TERM"
+		if force {
+			signal = "-KILL"
+		}
+		cmd = fmt.Sprintf("kill %s %d", signal, pid)
+	}
+	workDir, _ := r.resolveWorkDir("")
+	res, execErr := r.executor.Exec(ctx, cmd, workDir)
+	if execErr != nil {
+		return nil, fmt.Errorf("kill_pid: %w", execErr)
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("kill_pid: command failed (exit_code=%d): %s", res.ExitCode, strings.TrimSpace(res.Stderr+" "+res.Stdout))
+	}
+	return mustMarshal(KillPIDData{PID: pid, Force: force, Tree: tree, Result: res}), nil
 }
 
 // RegenServiceData is the JSON returned by "regen_service".
@@ -1212,10 +1272,10 @@ func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) 
 
 // UploadGuideData is the JSON returned by the "upload_guide" action.
 type UploadGuideData struct {
-	Source      string `json:"source"`
-	Destination string `json:"destination"`
-	ServerURL   string `json:"server_url"`
-	ClientID    string `json:"client_id,omitempty"`
+	Source      string   `json:"source"`
+	Destination string   `json:"destination"`
+	ServerURL   string   `json:"server_url"`
+	ClientID    string   `json:"client_id,omitempty"`
 	Steps       []string `json:"steps"`
 }
 

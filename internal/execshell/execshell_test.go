@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -18,9 +19,9 @@ import (
 // fakeRunner returns canned responses keyed by the command string. The
 // "test mode" path is therefore deterministic and does not touch the OS.
 type fakeRunner struct {
-	mu      sync.Mutex
-	byName  map[string]Result
-	delay   time.Duration
+	mu       sync.Mutex
+	byName   map[string]Result
+	delay    time.Duration
 	lastArgs []string
 }
 
@@ -76,6 +77,7 @@ func mustConfig(t *testing.T) *config.HelperConfig {
 
 func TestIsBlacklisted(t *testing.T) {
 	bad := []string{
+		`rmdir /q /s "D:\Program Files\data"`,
 		"rm -rf /",
 		"RM -RF /",
 		"format c:",
@@ -117,6 +119,10 @@ func TestExtractPaths(t *testing.T) {
 		{"type C:\\tomcat\\logs\\a.log", []string{`C:\tomcat\logs\a.log`}},
 		{"cd C:\\a && cat D:\\b.txt", []string{`C:\a`, `D:\b.txt`}},
 		{"echo hello", []string{}},
+		{`tomcat.exe //DS//tomcat10-esb`, []string{}},
+		{`sc config tomcat binPath= "tomcat.exe //RS//tomcat10"`, []string{}},
+		{`cmd /c "del /Q "D:\Program Files\MySql\dummy.txt""`, []string{`D:\Program Files\MySql\dummy.txt`}},
+		{`Get-Content 'D:\Program Files\MySql\my.ini'`, []string{`D:\Program Files\MySql\my.ini`}},
 		// cmd.exe switches must not be treated as paths.
 		{"rmdir /S /Q E:\\tomcat-helper\\test1", []string{`E:\tomcat-helper\test1`}},
 		{"del /F /Q C:\\some\\file.txt", []string{`C:\some\file.txt`}},
@@ -202,8 +208,8 @@ func TestExec_RejectsPathOutsideAllowedDirs(t *testing.T) {
 	cfg := mustConfig(t)
 	exec := NewExecutor(cfg).WithRunner(newFakeRunner())
 	_, err := exec.Exec(context.Background(), "cat /etc/passwd", cfg.AllowedDirs[0])
-	if !errors.Is(err, ErrWorkDirNotAllowed) {
-		t.Fatalf("expected ErrWorkDirNotAllowed, got %v", err)
+	if !errors.Is(err, ErrCommandPathNotAllowed) {
+		t.Fatalf("expected ErrCommandPathNotAllowed, got %v", err)
 	}
 }
 
@@ -342,5 +348,100 @@ func TestOSRunner_PreservesQuoting(t *testing.T) {
 				t.Fatalf("stdout should not echo the command, got %q", res.Stdout)
 			}
 		})
+	}
+}
+
+// TestOSRunner_TimeoutKillsWindowsProcessTree covers the failure mode where a
+// foreground launcher times out but its child keeps inherited output handles
+// open. Run must return promptly, kill the child, and remain usable afterward.
+func TestOSRunner_TimeoutKillsWindowsProcessTree(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows process-tree cleanup")
+	}
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	script := filepath.Join(dir, "spawn-child.ps1")
+	body := `$child = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList "127.0.0.1","-n","30" -PassThru -NoNewWindow
+[IO.File]::WriteAllText('` + strings.ReplaceAll(pidFile, `'`, `''`) + `', [string]$child.Id)
+$child.WaitForExit()
+`
+	if err := os.WriteFile(script, []byte(body), 0o644); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	runner := NewOSRunner()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+	runRes, err := runner.Run(ctx, "powershell", []string{"-NoProfile", "-NonInteractive", "-File", script}, dir)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("run error = %v, want deadline exceeded", err)
+	}
+	if took := time.Since(started); took > 8*time.Second {
+		t.Fatalf("process tree cleanup took %s", took)
+	}
+	pidBytes, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatalf("child pid was not recorded: %v; stdout=%q stderr=%q", readErr, runRes.Stdout, runRes.Stderr)
+	}
+	pid := strings.TrimSpace(string(pidBytes))
+	check := exec.Command("tasklist", "/FI", "PID eq "+pid, "/FO", "CSV", "/NH")
+	out, checkErr := check.CombinedOutput()
+	if checkErr != nil {
+		t.Fatalf("tasklist: %v (%s)", checkErr, out)
+	}
+	if strings.Contains(string(out), `"`+pid+`"`) {
+		t.Fatalf("child pid %s survived timeout: %s", pid, out)
+	}
+	name, args := splitCommand("echo channel-ok")
+	res, err := runner.Run(context.Background(), name, args, dir)
+	if err != nil || !strings.Contains(res.Stdout, "channel-ok") {
+		t.Fatalf("runner unusable after timeout: result=%+v err=%v", res, err)
+	}
+}
+
+func TestOSRunner_LongCommandDoesNotBlockAnotherExec(t *testing.T) {
+	dir := t.TempDir()
+	runner := NewOSRunner()
+	slowCtx, cancelSlow := context.WithCancel(context.Background())
+	defer cancelSlow()
+	done := make(chan error, 1)
+	go func() {
+		if runtime.GOOS == "windows" {
+			_, err := runner.Run(slowCtx, "powershell", []string{"-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 20"}, dir)
+			done <- err
+			return
+		}
+		_, err := runner.Run(slowCtx, "sh", []string{"-c", "sleep 20"}, dir)
+		done <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for len(runner.Running()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	active := runner.Running()
+	if len(active) != 1 || active[0].PID <= 0 || active[0].WorkDir != dir {
+		t.Fatalf("bad active commands: %+v", active)
+	}
+
+	quickCtx, cancelQuick := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelQuick()
+	name, args := splitCommand("echo concurrent-ok")
+	started := time.Now()
+	res, err := runner.Run(quickCtx, name, args, dir)
+	if err != nil || !strings.Contains(res.Stdout, "concurrent-ok") {
+		t.Fatalf("quick command was blocked: result=%+v err=%v", res, err)
+	}
+	if took := time.Since(started); took > 1500*time.Millisecond {
+		t.Fatalf("quick command waited behind long command for %s", took)
+	}
+
+	cancelSlow()
+	select {
+	case <-done:
+		if len(runner.Running()) != 0 {
+			t.Fatal("finished command still registered")
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("long command did not stop after cancellation")
 	}
 }

@@ -24,6 +24,17 @@ type fakeProbe struct {
 	ports []Port
 }
 
+type captureRunner struct {
+	name string
+	args []string
+}
+
+func (f *captureRunner) Run(_ context.Context, name string, args []string, _ string) (execshell.Result, error) {
+	f.name = name
+	f.args = append([]string(nil), args...)
+	return execshell.Result{ExitCode: 0, Stdout: "terminated"}, nil
+}
+
 func (f *fakeProbe) JavaProcesses(context.Context) ([]JavaProcess, error) {
 	return f.procs, nil
 }
@@ -300,6 +311,42 @@ func TestKillZombie_ByPattern(t *testing.T) {
 	}
 	if len(got.Found) != 1 || got.Found[0] != 99994 {
 		t.Fatalf("expected pid 99994 found, got %+v", got.Found)
+	}
+}
+
+func TestKillPID_BuildsPlatformCommand(t *testing.T) {
+	cfg := mustCfg(t)
+	runner := &captureRunner{}
+	reg := NewRegistry(cfg, execshell.NewExecutor(cfg).WithRunner(runner))
+	raw, err := reg.killProcess(context.Background(), mustMarshal(map[string]any{"pid": float64(424242)}))
+	if err != nil {
+		t.Fatalf("killProcess: %v", err)
+	}
+	var got KillPIDData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	joined := runner.name + " " + strings.Join(runner.args, " ")
+	if runtime.GOOS == "windows" {
+		for _, want := range []string{"taskkill", "/T", "/F", "/PID 424242"} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("Windows kill command %q missing %q", joined, want)
+			}
+		}
+		if !got.Tree || !got.Force {
+			t.Fatalf("Windows defaults = tree:%v force:%v, want true/true", got.Tree, got.Force)
+		}
+	} else if !strings.Contains(joined, "kill -KILL 424242") {
+		t.Fatalf("Unix kill command = %q", joined)
+	}
+}
+
+func TestKillPID_RejectsHelperItself(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	_, err := reg.killProcess(context.Background(), mustMarshal(map[string]any{"pid": float64(os.Getpid())}))
+	if err == nil || !strings.Contains(err.Error(), "helper process itself") {
+		t.Fatalf("expected self-kill rejection, got %v", err)
 	}
 }
 
