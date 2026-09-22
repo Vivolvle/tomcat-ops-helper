@@ -50,9 +50,29 @@ func coreTools() []Tool {
 			InputSchema: tailSchema,
 		},
 		{
+			Name:        "stop_service",
+			Description: "Stop the Tomcat Windows service via sc stop. Waits for catalina processes to confirm exit. Returns the service name, sc stop result, and whether catalina confirmed exited. Use this to stop Tomcat without immediately starting it — for deploy or manual control.",
+			InputSchema: stopServiceSchema,
+		},
+		{
+			Name:        "start_service",
+			Description: "Start the Tomcat Windows service via sc start. Waits for service to reach RUNNING state. Returns the service name, sc start result, and whether the service confirmed RUNNING.",
+			InputSchema: startServiceSchema,
+		},
+		{
 			Name:        "restart",
-			Description: "Run Tomcat shutdown then startup scripts. Honors timeout in seconds (default cfg.command_timeout).",
+			Description: "Restart Tomcat. On Windows uses sc stop/sc start with separate stop_timeout and start_timeout (default cfg.command_timeout each). Gives you separate stop/start control so long startup (deployWAR etc.) doesn't cause a single timeout. Optionally accepts stop_timeout and start_timeout params.",
 			InputSchema: restartSchema,
+		},
+		{
+			Name:        "deploy",
+			Description: "Full deploy cycle: stop_service → wait for catalina exit → replace_jar → start_service. Use this one-shot action instead of manually calling stop/replace/start. Requires src and dest for the jar, plus optional stop_timeout/start_timeout.",
+			InputSchema: deploySchema,
+		},
+		{
+			Name:        "wait_for_catalina",
+			Description: "Poll until catalina processes reach a target state: 'gone' (all catalina JVMs exited) or 'running' (at least one catalina JVM found). Returns whether the state was reached and if a timeout occurred.",
+			InputSchema: waitCatalinaSchema,
 		},
 		{
 			Name:        "replace_jar",
@@ -61,7 +81,7 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "kill_zombie",
-			Description: "Find Tomcat/catalina JVMs matching pid or pattern, kill -9 / taskkill /F. Returns the candidate set and per-PID kill results.",
+			Description: "Find Tomcat/catalina JVMs matching pid or pattern, kill -9 / taskkill /F. Returns the candidate set and per-PID kill results. When a specific pid is given, it will also match catalina processes even if isInteresting does not catch them — the PID is authoritative.",
 			InputSchema: killZombieSchema,
 		},
 		{
@@ -124,8 +144,48 @@ var tailSchema = json.RawMessage(`{
 var restartSchema = json.RawMessage(`{
 	"type":"object",
 	"properties":{
-		"timeout":{"type":"integer","description":"Per-step timeout in seconds; defaults to cfg.command_timeout.","minimum":1}
+		"stop_timeout":{"type":"integer","description":"Timeout in seconds for the stop step; defaults to cfg.command_timeout.","minimum":1},
+		"start_timeout":{"type":"integer","description":"Timeout in seconds for the start step; defaults to cfg.command_timeout (same as stop_timeout if not set).","minimum":1}
 	},
+	"additionalProperties":false
+}`)
+
+var stopServiceSchema = json.RawMessage(`{
+	"type":"object",
+	"properties":{
+		"timeout":{"type":"integer","description":"Timeout in seconds for sc stop; defaults to cfg.command_timeout.","minimum":1},
+		"wait_timeout":{"type":"integer","description":"Timeout in seconds to wait for catalina processes to exit after sc stop; defaults to timeout.","minimum":1}
+	},
+	"additionalProperties":false
+}`)
+
+var startServiceSchema = json.RawMessage(`{
+	"type":"object",
+	"properties":{
+		"timeout":{"type":"integer","description":"Timeout in seconds for sc start and wait for RUNNING state; defaults to cfg.command_timeout.","minimum":1}
+	},
+	"additionalProperties":false
+}`)
+
+var waitCatalinaSchema = json.RawMessage(`{
+	"type":"object",
+	"properties":{
+		"state":{"type":"string","description":"Target state: 'gone' waits for catalina processes to exit; 'running' waits for at least one catalina process to appear. Defaults to 'gone'.","enum":["gone","running"]},
+		"timeout":{"type":"integer","description":"Maximum seconds to poll; defaults to cfg.command_timeout.","minimum":1}
+	},
+	"additionalProperties":false
+}`)
+
+var deploySchema = json.RawMessage(`{
+	"type":"object",
+	"properties":{
+		"src":{"type":"string","description":"Source jar path; must be under allowed_dirs."},
+		"dest":{"type":"string","description":"Destination jar path; must be under allowed_dirs."},
+		"restart":{"type":"boolean","description":"If true (default), also stop and start the service around the jar replacement."},
+		"stop_timeout":{"type":"integer","description":"Timeout in seconds for stop_service step.","minimum":1},
+		"start_timeout":{"type":"integer","description":"Timeout in seconds for start_service step.","minimum":1}
+	},
+	"required":["src","dest"],
 	"additionalProperties":false
 }`)
 
@@ -143,7 +203,7 @@ var replaceJarSchema = json.RawMessage(`{
 var killZombieSchema = json.RawMessage(`{
 	"type":"object",
 	"properties":{
-		"pid":{"type":"integer","description":"Exact PID to kill.","minimum":1},
+		"pid":{"type":"integer","description":"Exact PID to kill. Matches catalina processes even if isInteresting does not catch them — the PID is authoritative.","minimum":1},
 		"pattern":{"type":"string","description":"Substring to match in cmdline (case-insensitive)."}
 	},
 	"additionalProperties":false

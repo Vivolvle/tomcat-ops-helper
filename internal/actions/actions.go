@@ -104,6 +104,14 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.tail(params)
 	case "restart":
 		return r.restart(ctx, params)
+	case "stop_service":
+		return r.stopService(ctx, params)
+	case "start_service":
+		return r.startService(ctx, params)
+	case "deploy":
+		return r.deploy(ctx, params)
+	case "wait_for_catalina":
+		return r.waitCatalina(ctx, params)
 	case "replace_jar":
 		return r.replaceJar(ctx, params)
 	case "kill_zombie":

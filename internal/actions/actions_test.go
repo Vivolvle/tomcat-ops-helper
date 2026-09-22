@@ -1043,3 +1043,188 @@ func TestTools_SchemasAreValidJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestTools_HaveNewActions ensures stop_service, start_service,
+// wait_for_catalina, deploy, and the updated restart schema are all
+// present in the tool list. This is a smoke test for the
+// problem.md #1/#2/#4 fixes: the new atomic actions must exist.
+func TestTools_HaveNewActions(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	names := map[string]bool{}
+	for _, tool := range reg.Tools() {
+		names[tool.Name] = true
+	}
+	for _, want := range []string{"stop_service", "start_service", "wait_for_catalina", "deploy"} {
+		if !names[want] {
+			t.Fatalf("missing tool %q", want)
+		}
+	}
+	if !names["restart"] {
+		t.Fatal("missing restart tool")
+	}
+}
+
+// TestTools_RestartSchemaHasSeparateTimeouts ensures the restart schema
+// includes stop_timeout and start_timeout (problem.md #1 fix).
+func TestTools_RestartSchemaHasSeparateTimeouts(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t))
+	var restartSchema json.RawMessage
+	for _, tool := range reg.Tools() {
+		if tool.Name == "restart" {
+			restartSchema = tool.InputSchema
+			break
+		}
+	}
+	if restartSchema == nil {
+		t.Fatal("restart tool not found")
+	}
+	var s map[string]any
+	if err := json.Unmarshal(restartSchema, &s); err != nil {
+		t.Fatalf("restart schema not valid JSON: %v", err)
+	}
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("restart schema has no properties")
+	}
+	if _, ok := props["stop_timeout"]; !ok {
+		t.Fatal("restart schema missing stop_timeout")
+	}
+	if _, ok := props["start_timeout"]; !ok {
+		t.Fatal("restart schema missing start_timeout")
+	}
+}
+
+// TestKillZombie_MatchesByPIDRegardlessOfInteresting ensures that
+// kill_zombie pid=X matches the PID even when isInteresting does not
+// catch the process (problem.md #3 fix).
+func TestKillZombie_MatchesByPIDRegardlessOfInteresting(t *testing.T) {
+	cfg := mustCfg(t)
+	probe := &fakeProbe{procs: []JavaProcess{
+		{PID: 99991, Cmdline: "java -jar random-app.jar"}, // not interesting
+		{PID: 99992, Cmdline: "java -Dcatalina.home=/opt/tomcat org.apache.catalina.startup.Bootstrap"},
+	}}
+	reg := NewRegistry(cfg, mustExec(t)).WithProbe(probe)
+	raw, err := reg.killZombie(context.Background(), mustMarshal(map[string]any{"pid": float64(99991)}))
+	if err != nil {
+		t.Fatalf("killZombie: %v", err)
+	}
+	var got KillZombieData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Found) != 1 || got.Found[0] != 99991 {
+		t.Fatalf("expected pid 99991 found (regardless of isInteresting), got %+v", got.Found)
+	}
+}
+
+// TestStopService_UnknownServiceName returns an error when the
+// service name cannot be determined (no cfg.ServiceName and no
+// sc query results).
+func TestStopService_UnknownServiceName(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.ServiceName = "" // force discover which needs sc
+	reg := NewRegistry(cfg, mustExec(t))
+	_, err := reg.stopService(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error for unknown service name")
+	}
+}
+
+// TestStartService_UnknownServiceName returns an error when the
+// service name cannot be determined.
+func TestStartService_UnknownServiceName(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.ServiceName = ""
+	reg := NewRegistry(cfg, mustExec(t))
+	_, err := reg.startService(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error for unknown service name")
+	}
+}
+
+// TestWaitCatalina_GoneReturnsEarly ensures wait_for_catalina with
+// state=gone returns immediately when no catalina processes exist.
+func TestWaitCatalina_GoneReturnsEarly(t *testing.T) {
+	cfg := mustCfg(t)
+	probe := &fakeProbe{procs: []JavaProcess{}}
+	reg := NewRegistry(cfg, mustExec(t)).WithProbe(probe)
+	raw, err := reg.waitCatalina(context.Background(), mustMarshal(map[string]any{"state": "gone"}))
+	if err != nil {
+		t.Fatalf("waitCatalina: %v", err)
+	}
+	var got WaitCatalinaData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Exited {
+		t.Fatal("expected Exited=true when no catalina processes")
+	}
+	if got.Wanted != "gone" {
+		t.Fatalf("expected Wanted='gone', got %q", got.Wanted)
+	}
+}
+
+// TestDeploy_ReturnsPartialResultOnStopFailure ensures deploy returns
+// a partial result (with step set) when stop_service fails, rather
+// than a hard error — so the caller can see what happened.
+func TestDeploy_StopFailureReturnsPartialResult(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.ServiceName = "" // force unknown service name → stop_service fails
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.deploy(context.Background(), mustMarshal(map[string]any{
+		"src": "a.jar", "dest": "b.jar",
+	}))
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	var got DeployData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Step != "stop_service" {
+		t.Fatalf("expected step='stop_service', got %q", got.Step)
+	}
+	if got.Error == "" {
+		t.Fatal("expected Error to be set on stop failure")
+	}
+}
+
+// TestReplaceJar_WithRestartFalse_ReturnsDataWithoutRestartFields
+// ensures replace_jar with restart=false returns data without
+// restart_data or restart_error fields.
+func TestReplaceJar_WithRestartFalse_ReturnsDataWithoutRestartFields(t *testing.T) {
+	cfg := mustCfg(t)
+	webapps := filepath.Join(cfg.TomcatHome, "webapps")
+	if err := os.MkdirAll(webapps, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	src := filepath.Join(cfg.TomcatHome, "uploads", "app.jar")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(src, []byte("JAR-CONTENT"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	dst := filepath.Join(webapps, "app.jar")
+	if err := os.WriteFile(dst, []byte("OLD-JAR"), 0o644); err != nil {
+		t.Fatalf("seed dest: %v", err)
+	}
+
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.replaceJar(context.Background(), mustMarshal(map[string]any{"src": src, "dest": dst, "restart": false}))
+	if err != nil {
+		t.Fatalf("replaceJar: %v", err)
+	}
+	var got ReplaceJarData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Restarted {
+		t.Fatal("restart=false should not set Restarted")
+	}
+	if got.RestartData != nil {
+		t.Fatal("restart=false should not set RestartData")
+	}
+}

@@ -30,12 +30,24 @@
 
 ## 问题 3：kill_zombie pid=15168 找不到、status 里 java_processes 一直是 null
 
-**修复**：改进 `isInteresting` 函数，扩展识别范围。
+**修复**：改进 `isInteresting` 函数，扩展识别范围；改进 `kill_zombie` 匹配逻辑。
 - 添加对 `org.apache.catalina.startup.bootstrap` 的识别（Tomcat 主类）
 - 添加对 `-Dcatalina.home=` 和 `-Dcatalina.base=` JVM 参数的识别
-- 这些参数在 procrun 启动的 Tomcat 进程中常见
+- `kill_zombie pid=X` 现在即使 `isInteresting` 不匹配也按 PID 精确匹配
 
-**文件**：`internal/actions/impl.go:68-80`
+**文件**：`internal/actions/impl.go:68-80,678-710`
+
+## 问题 4：restart 整体 timeout，无法支持慢启动应用
+
+**修复**：拆分为原子操作 + 复合 deploy。
+- 新增 `stop_service`：sc stop + 等 catalina 退出（separate timeout）
+- 新增 `start_service`：sc start + 等 RUNNING（separate timeout）
+- 新增 `wait_for_catalina`：轮询 catalina gone/running 状态
+- 新增 `deploy` 复合动作：stop_service → replace_jar(restart=false) → start_service
+- `restart` 拆为 `stop_timeout` + `start_timeout` 两个独立超时参数
+- `waitForCatalinaExit` 改为非致命：超时不阻断 restart 继续启动
+
+**文件**：`internal/actions/impl.go,internal/actions/actions.go,internal/actions/tools.go`
 
 ## 测试结果
 
@@ -54,11 +66,18 @@ ok  	tomcat-ops-helper/internal/wsserver
 
 所有测试通过，`go vet` 无警告。
 
+**新增测试**：
+- `TestTools_HaveNewActions` — 确认 stop_service/start_service/wait_for_catalina/deploy 全部在工具列表中
+- `TestTools_RestartSchemaHasSeparateTimeouts` — 确认 restart schema 包含 stop_timeout/start_timeout
+- `TestKillZombie_MatchesByPIDRegardlessOfInteresting` — 确认 kill_zombie pid=X 即使 isInteresting 不匹配也生效
+- `TestWaitCatalina_GoneReturnsEarly` — 确认 wait_for_catalina state=gone 在无进程时立即返回
+- `TestDeploy_StopFailureReturnsPartialResult` — 确认 deploy 在 stop 失败时返回部分结果（而非硬错误）
+
 ## 构建与部署
 
 - `bin\helper.exe` 已重建（2026-09-22）
 - 已同步到 `D:\tools\helper-client\helper.exe`
-- sha256: `66D4832563AA87E2A17B1BE1872F9946AF0F2826D9809CCEB103FADC4CE3CDEE`
+- sha256: `C9D86507DB0EB88C903FB5CEB17E8697A9863DDC76DDF9D865C3FCD3D351CAE2`
 
 ---
 

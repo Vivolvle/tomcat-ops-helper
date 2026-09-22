@@ -161,15 +161,14 @@ func (r *Registry) tail(params json.RawMessage) (json.RawMessage, error) {
 	return mustMarshal(TailData{File: abs, Lines: len(body), Body: body}), nil
 }
 
-// RestartData is the JSON returned by "restart".
-type RestartData struct {
-	Mode        string           `json:"mode"`
-	ServiceName string           `json:"service_name,omitempty"`
-	Shutdown    execshell.Result `json:"shutdown"`
-	Startup     execshell.Result `json:"startup"`
+// StopServiceData is the JSON returned by "stop_service".
+type StopServiceData struct {
+	ServiceName string        `json:"service_name"`
+	Stop        execshell.Result `json:"stop"`
+	Exited      bool          `json:"exited"` // true if catalina processes confirmed gone
 }
 
-func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+func (r *Registry) stopService(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
 	p, err := decodeParams(params)
 	if err != nil {
 		return nil, err
@@ -178,9 +177,266 @@ func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.Ra
 	if v, ok := p["timeout"].(float64); ok && v > 0 {
 		timeout = time.Duration(v * float64(time.Second))
 	}
+	serviceName := r.discoverWindowsServiceName(ctx)
+	if serviceName == "" {
+		return nil, fmt.Errorf("stop_service: cannot determine Windows service name")
+	}
+	data := StopServiceData{ServiceName: serviceName}
+	stopCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	data.Stop, err = r.executor.Exec(stopCtx, fmt.Sprintf("sc stop %q", serviceName), r.cfg.TomcatHome)
+	if err != nil || (data.Stop.ExitCode != 0 && !strings.Contains(strings.ToLower(data.Stop.Stdout+data.Stop.Stderr), "1062")) {
+		return nil, fmt.Errorf("stop_service: service %s did not accept stop: %s", serviceName, resultMessage(data.Stop, err))
+	}
+	// Wait for catalina processes to actually exit
+	waitTimeout := timeout
+	if v, ok := p["wait_timeout"].(float64); ok && v > 0 {
+		waitTimeout = time.Duration(v * float64(time.Second))
+	}
+	if err := r.waitForCatalinaExitWithTimeout(stopCtx, waitTimeout); err == nil {
+		data.Exited = true
+	} else if perr, ok := err.(*waitTimeoutError); ok && perr.timedOut {
+		// Not fatal - some catalina processes may linger
+		data.Exited = false
+	} else {
+		return nil, fmt.Errorf("stop_service: catalina exit wait failed: %w", err)
+	}
+	return mustMarshal(data), nil
+}
+
+// waitTimeoutError is a sentinel for when waitForCatalinaExit times out.
+type waitTimeoutError struct {
+	timedOut bool
+}
+
+func (e *waitTimeoutError) Error() string {
+	return "catalina processes still running after timeout"
+}
+
+// waitForCatalinaExitWithTimeout waits for catalina processes to exit, returning a
+// waitTimeoutError if they don't exit in time (non-fatal).
+func (r *Registry) waitForCatalinaExitWithTimeout(ctx context.Context, timeout time.Duration) error {
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		procs, err := r.probe.JavaProcesses(pollCtx)
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, p := range procs {
+			if isInteresting(p, r.cfg.TomcatHome) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+		select {
+		case <-pollCtx.Done():
+			return &waitTimeoutError{timedOut: true}
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// StartServiceData is the JSON returned by "start_service".
+type StartServiceData struct {
+	ServiceName string        `json:"service_name"`
+	Start       execshell.Result `json:"start"`
+	Running     bool          `json:"running"` // true if service confirmed RUNNING
+}
+
+func (r *Registry) startService(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+	timeout := r.cfg.CommandTimeout
+	if v, ok := p["timeout"].(float64); ok && v > 0 {
+		timeout = time.Duration(v * float64(time.Second))
+	}
+	serviceName := r.discoverWindowsServiceName(ctx)
+	if serviceName == "" {
+		return nil, fmt.Errorf("start_service: cannot determine Windows service name")
+	}
+	data := StartServiceData{ServiceName: serviceName}
+	startCtx, startCancel := context.WithTimeout(ctx, timeout)
+	defer startCancel()
+	data.Start, err = r.executor.Exec(startCtx, fmt.Sprintf("sc start %q", serviceName), r.cfg.TomcatHome)
+	if err != nil || data.Start.ExitCode != 0 {
+		return nil, fmt.Errorf("start_service: service %s failed to start: %s", serviceName, resultMessage(data.Start, err))
+	}
+	if err := r.waitServiceState(startCtx, serviceName, "RUNNING"); err != nil {
+		return nil, fmt.Errorf("start_service: service %s did not reach RUNNING within %s: %w", serviceName, timeout, err)
+	}
+	data.Running = true
+	return mustMarshal(data), nil
+}
+
+// WaitCatalinaData is the JSON returned by "wait_for_catalina".
+type WaitCatalinaData struct {
+	ServiceName string `json:"service_name,omitempty"`
+	Wanted      string `json:"wanted"`
+	Exited      bool   `json:"exited"` // true if catalina processes gone
+	Running     bool   `json:"running"` // true if catalina processes found
+	TimedOut    bool   `json:"timed_out"`
+}
+
+func (r *Registry) waitCatalina(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+	timeout := r.cfg.CommandTimeout
+	if v, ok := p["timeout"].(float64); ok && v > 0 {
+		timeout = time.Duration(v * float64(time.Second))
+	}
+	state, _ := p["state"].(string)
+	if state != "gone" && state != "running" {
+		state = "gone" // default
+	}
+	data := WaitCatalinaData{Wanted: state}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		procs, err := r.probe.JavaProcesses(waitCtx)
+		if err != nil {
+			return nil, fmt.Errorf("wait_for_catalina: probe: %w", err)
+		}
+		found := false
+		for _, pr := range procs {
+			if isInteresting(pr, r.cfg.TomcatHome) {
+				found = true
+				break
+			}
+		}
+		if state == "gone" && !found {
+			data.Exited = true
+			return mustMarshal(data), nil
+		}
+		if state == "running" && found {
+			data.Running = true
+			return mustMarshal(data), nil
+		}
+		select {
+		case <-waitCtx.Done():
+			data.TimedOut = true
+			if state == "gone" {
+				return mustMarshal(data), nil // return partial result, not error
+			}
+			return nil, fmt.Errorf("wait_for_catalina: timed out waiting for state %s", state)
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// DeployData is the JSON returned by "deploy".
+type DeployData struct {
+	ServiceName    string         `json:"service_name,omitempty"`
+	StopResult     *StopServiceData `json:"stop_result,omitempty"`
+	ReplaceResult  *ReplaceJarData  `json:"replace_result,omitempty"`
+	StartResult    *StartServiceData  `json:"start_result,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	Step           string         `json:"step"` // which step failed
+}
+
+func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+	src, _ := p["src"].(string)
+	dst, _ := p["dest"].(string)
+	restart := true
+	if v, ok := p["restart"].(bool); ok {
+		restart = v
+	}
+	stopTimeout := r.cfg.CommandTimeout
+	if v, ok := p["stop_timeout"].(float64); ok && v > 0 {
+		stopTimeout = time.Duration(v * float64(time.Second))
+	}
+	startTimeout := stopTimeout
+	if v, ok := p["start_timeout"].(float64); ok && v > 0 {
+		startTimeout = time.Duration(v * float64(time.Second))
+	}
+	data := DeployData{Step: "begin"}
+	serviceName := r.discoverWindowsServiceName(ctx)
+	if serviceName != "" {
+		data.ServiceName = serviceName
+	}
+
+	// Step 1: stop the service
+	stopCtx, cancel := context.WithTimeout(ctx, stopTimeout)
+	defer cancel()
+	stopRaw, stopErr := r.stopService(stopCtx, mustMarshal(map[string]any{"timeout": float64(stopTimeout.Seconds()), "wait_timeout": float64(stopTimeout.Seconds())}))
+	if stopErr != nil {
+		data.Error = stopErr.Error()
+		data.Step = "stop_service"
+		return mustMarshal(data), nil // return partial result, not error
+	}
+	var stopData StopServiceData
+	if jsonErr := json.Unmarshal(stopRaw, &stopData); jsonErr == nil {
+		data.StopResult = &stopData
+	}
+
+	// Step 2: replace jar if src/dest provided
+	if restart && src != "" && dst != "" {
+		replaceRaw, replaceErr := r.replaceJar(ctx, mustMarshal(map[string]any{"src": src, "dest": dst, "restart": false}))
+		if replaceErr != nil {
+			data.Error = replaceErr.Error()
+			data.Step = "replace_jar"
+			return mustMarshal(data), nil
+		}
+		var replaceData ReplaceJarData
+		if jsonErr := json.Unmarshal(replaceRaw, &replaceData); jsonErr == nil {
+			data.ReplaceResult = &replaceData
+		}
+	}
+
+	// Step 3: start the service
+	startCtx, startCancel := context.WithTimeout(ctx, startTimeout)
+	defer startCancel()
+	startRaw, startErr := r.startService(startCtx, mustMarshal(map[string]any{"timeout": float64(startTimeout.Seconds())}))
+	if startErr != nil {
+		data.Error = startErr.Error()
+		data.Step = "start_service"
+		return mustMarshal(data), nil
+	}
+	var startData StartServiceData
+	if jsonErr := json.Unmarshal(startRaw, &startData); jsonErr == nil {
+		data.StartResult = &startData
+	}
+
+	return mustMarshal(data), nil
+}
+
+// RestartData is the JSON returned by "restart".
+type RestartData struct {
+	Mode        string           `json:"mode"`
+	ServiceName string           `json:"service_name,omitempty"`
+	Shutdown    execshell.Result `json:"shutdown"`
+	Startup     execshell.Result `json:"startup"`
+	Exited      bool             `json:"exited"` // catalina confirmed exited
+}
+
+func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+	stopTimeout := r.cfg.CommandTimeout
+	if v, ok := p["stop_timeout"].(float64); ok && v > 0 {
+		stopTimeout = time.Duration(v * float64(time.Second))
+	}
+	startTimeout := stopTimeout
+	if v, ok := p["start_timeout"].(float64); ok && v > 0 {
+		startTimeout = time.Duration(v * float64(time.Second))
+	}
 	if runtime.GOOS == "windows" {
 		serviceName := r.discoverWindowsServiceName(ctx)
-		if data, handled, err := r.restartWindowsService(ctx, serviceName, timeout); handled {
+		if data, handled, err := r.restartWindowsService(ctx, serviceName, stopTimeout, startTimeout); handled {
 			if err != nil {
 				return nil, err
 			}
@@ -198,7 +454,7 @@ func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.Ra
 	}
 	workDir := r.cfg.TomcatHome
 
-	downCtx, cancel := context.WithTimeout(ctx, timeout)
+	downCtx, cancel := context.WithTimeout(ctx, stopTimeout)
 	defer cancel()
 	shutdown, _ := r.executor.Exec(downCtx, binQuote(bin, runtime.GOOS), workDir)
 
@@ -214,7 +470,7 @@ func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.Ra
 	} else {
 		up = filepath.Join(r.cfg.TomcatHome, "bin", "startup.sh")
 	}
-	upCtx, upCancel := context.WithTimeout(ctx, timeout)
+	upCtx, upCancel := context.WithTimeout(ctx, startTimeout)
 	defer upCancel()
 	startup, _ := r.executor.Exec(upCtx, binQuote(up, runtime.GOOS), workDir)
 
@@ -251,7 +507,7 @@ func (r *Registry) discoverWindowsServiceName(ctx context.Context) string {
 // restartWindowsService uses SCM for Tomcat installations registered through
 // Apache Commons Daemon/procrun. Running shutdown.bat against such an install
 // can exit 0 without stopping the service (and may even use a different JRE).
-func (r *Registry) restartWindowsService(ctx context.Context, serviceName string, timeout time.Duration) (RestartData, bool, error) {
+func (r *Registry) restartWindowsService(ctx context.Context, serviceName string, stopTimeout, startTimeout time.Duration) (RestartData, bool, error) {
 	workDir := r.cfg.TomcatHome
 	qc, err := r.executor.Exec(ctx, fmt.Sprintf("sc qc %q", serviceName), workDir)
 	if err != nil || qc.ExitCode != 0 {
@@ -263,29 +519,29 @@ func (r *Registry) restartWindowsService(ctx context.Context, serviceName string
 	}
 
 	data := RestartData{Mode: "windows_service", ServiceName: serviceName}
-	stopCtx, cancel := context.WithTimeout(ctx, timeout)
+	stopCtx, cancel := context.WithTimeout(ctx, stopTimeout)
 	defer cancel()
 	data.Shutdown, err = r.executor.Exec(stopCtx, fmt.Sprintf("sc stop %q", serviceName), workDir)
 	if err != nil || (data.Shutdown.ExitCode != 0 && !strings.Contains(strings.ToLower(data.Shutdown.Stdout+data.Shutdown.Stderr), "1062")) {
 		return data, true, fmt.Errorf("restart: service %s did not accept stop; use sc stop %s manually: %s", serviceName, serviceName, resultMessage(data.Shutdown, err))
 	}
 	if err := r.waitServiceState(stopCtx, serviceName, "STOPPED"); err != nil {
-		return data, true, fmt.Errorf("restart: service %s was not stopped within %s; consider taskkill /F /PID after checking sc queryex %s: %w", serviceName, timeout, serviceName, err)
+		return data, true, fmt.Errorf("restart: service %s was not stopped within %s; consider taskkill /F /PID after checking sc queryex %s: %w", serviceName, stopTimeout, serviceName, err)
 	}
 	
 	// Wait for catalina processes to actually exit after service stops
-	if err := r.waitForCatalinaExit(stopCtx); err != nil {
-		return data, true, fmt.Errorf("restart: catalina processes did not exit after service stop: %w", err)
+	if err := r.waitForCatalinaExitWithTimeout(stopCtx, stopTimeout); err != nil {
+		// Non-fatal: catalina may linger but we can still try to start
 	}
 
-	startCtx, startCancel := context.WithTimeout(ctx, timeout)
+	startCtx, startCancel := context.WithTimeout(ctx, startTimeout)
 	defer startCancel()
 	data.Startup, err = r.executor.Exec(startCtx, fmt.Sprintf("sc start %q", serviceName), workDir)
 	if err != nil || data.Startup.ExitCode != 0 {
 		return data, true, fmt.Errorf("restart: service %s failed to start: %s", serviceName, resultMessage(data.Startup, err))
 	}
 	if err := r.waitServiceState(startCtx, serviceName, "RUNNING"); err != nil {
-		return data, true, fmt.Errorf("restart: service %s did not reach RUNNING within %s: %w", serviceName, timeout, err)
+		return data, true, fmt.Errorf("restart: service %s did not reach RUNNING within %s: %w", serviceName, startTimeout, err)
 	}
 	return data, true, nil
 }
@@ -311,36 +567,7 @@ func (r *Registry) waitServiceState(ctx context.Context, serviceName, wanted str
 // waitForCatalinaExit waits for all catalina-related Java processes to exit.
 // This addresses the issue where service stops but catalina processes remain running.
 func (r *Registry) waitForCatalinaExit(ctx context.Context) error {
-	// Poll for up to 30 seconds, checking every second
-	pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	
-	for {
-		procs, err := r.probe.JavaProcesses(pollCtx)
-		if err != nil {
-			return err
-		}
-		
-		// Check if any catalina processes are still running
-		found := false
-		for _, p := range procs {
-			if isInteresting(p, r.cfg.TomcatHome) {
-				found = true
-				break
-			}
-		}
-		
-		if !found {
-			return nil // All catalina processes have exited
-		}
-		
-		select {
-		case <-pollCtx.Done():
-			return fmt.Errorf("catalina processes still running after timeout")
-		case <-time.After(time.Second):
-			// Continue polling
-		}
-	}
+	return r.waitForCatalinaExitWithTimeout(ctx, 30*time.Second)
 }
 
 func resultMessage(res execshell.Result, err error) string {
@@ -462,10 +689,21 @@ func (r *Registry) killZombie(ctx context.Context, params json.RawMessage) (json
 	}
 	data := KillZombieData{}
 	for _, jp := range procs {
+		// When a specific PID is given, match it regardless of isInteresting —
+		// the PID is authoritative (fixes problem.md #3).
+		if hasPID && int(pidF) == jp.PID {
+			data.Found = append(data.Found, jp.PID)
+			if err := killPID(ctx, jp.PID); err != nil {
+				data.Errors = append(data.Errors, fmt.Sprintf("pid=%d: %v", jp.PID, err))
+				continue
+			}
+			data.Killed = append(data.Killed, jp.PID)
+			continue
+		}
 		if !isInteresting(jp, r.cfg.TomcatHome) {
 			continue
 		}
-		match := hasPID && int(pidF) == jp.PID
+		match := false
 		if pattern != "" && strings.Contains(strings.ToLower(jp.Cmdline), strings.ToLower(pattern)) {
 			match = true
 		}
