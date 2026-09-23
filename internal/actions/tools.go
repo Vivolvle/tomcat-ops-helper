@@ -34,6 +34,7 @@ func (r *Registry) Tools() []Tool {
 // coreTools is the static, always-present tool list.
 func coreTools() []Tool {
 	return []Tool{
+		httpCallTool,
 		{Name: "list_exec", Description: "List currently running helper shell commands with PID, arguments, working directory and start time. Use kill_pid to stop a command.", InputSchema: emptyObjectSchema},
 		{Name: "read_file", Description: "Read an existing UTF-8 text file in allowed_dirs, up to 1 MiB. Returns exact text and SHA256. Local editor tools cannot read remote helper files.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`)},
 		{Name: "replace_text", Description: "Atomically replace literal text in an existing UTF-8 file in allowed_dirs, up to 1 MiB. Preserves BOM and line endings. Default expected_count=1; mismatch leaves file unchanged. Optional expected_sha256 checks the version read earlier.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"expected_count":{"type":"integer","minimum":1},"expected_sha256":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}`)},

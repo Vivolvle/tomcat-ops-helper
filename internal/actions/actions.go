@@ -96,6 +96,8 @@ func (r *Registry) CleanupStaleUploads(maxAge time.Duration) int {
 // Dispatch routes an action by name.
 func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMessage) (json.RawMessage, error) {
 	switch name {
+	case "http_call":
+		return r.httpCall(ctx, params)
 	case "status":
 		return r.status(ctx)
 	case "list_logs":

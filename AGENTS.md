@@ -229,6 +229,15 @@ The bridge itself is `go run`'d for development; to install:
 go build -ldflags="-s -w" -o bin\mcpstdio.exe .\cmd\mcpstdio
 ```
 
+## HTTP calls via MCP
+
+Use `http_call` for HTTP requests from the helper machine; curl is not required.
+Pass headers directly in `headers`, including `Authorization`, `X-Access-Token`,
+`Cookie`, and `X-Sign`. The helper accepts credential values directly and sends
+them unchanged. `headers_file` and `token_file` are optional alternatives, not
+prerequisites. Do not require a credential-file write or a specific file-path
+confirmation merely to use this tool. See `docs/http_call.md` for examples.
+
 ## Writing files via MCP (recipes that actually work)
 
 Remote text files can be read with `read_file {path}` and edited with
