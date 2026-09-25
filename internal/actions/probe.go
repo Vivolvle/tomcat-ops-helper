@@ -33,24 +33,62 @@ func (p *OSProbe) JavaProcesses(ctx context.Context) ([]JavaProcess, error) {
 }
 
 func (p *OSProbe) javaProcessesWindows(ctx context.Context) ([]JavaProcess, error) {
+	// Enumerate ALL processes and filter in Go with looksLikeJVM. A
+	// server-side `Name='java.exe'` filter misses Tomcat installed as a
+	// Windows service: procrun's default --StartMode=jvm loads jvm.dll
+	// into the renamed service binary (e.g. tomcat10-esb.exe), so no
+	// java.exe process ever exists and status/wait_for_catalina saw a
+	// permanent empty list (2026-09-25 report).
+	//
 	// wmic was deprecated in newer Windows builds and is often absent from
 	// PATH. Fall back to PowerShell so we keep working on current OS images.
 	if _, err := exec.LookPath("wmic"); err == nil {
-		cmd := exec.CommandContext(ctx, "wmic", "process", "where", "name=\"java.exe\"", "get", "ProcessId,CommandLine", "/format:list")
+		cmd := exec.CommandContext(ctx, "wmic", "process", "get", "ProcessId,Name,CommandLine", "/format:list")
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		if err := cmd.Run(); err == nil {
-			return parseWmicList(out.String()), nil
+			return filterInterestingProcesses(parseWmicList(out.String())), nil
 		}
 	}
-	psCmd := `Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation`
+	psCmd := `Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Csv -NoTypeInformation`
 	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", psCmd)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("powershell: %w", err)
 	}
-	return parsePowerShellCSV(out.String()), nil
+	return filterInterestingProcesses(parsePowerShellCSV(out.String())), nil
+}
+
+// looksLikeJVM reports whether an enumerated Windows process could be
+// hosting the Tomcat JVM: a java executable, or — for Tomcat registered as
+// a Windows service via procrun with StartMode=jvm — the renamed prunsrv
+// binary whose image name or command line references tomcat/catalina
+// (e.g. "D:\...\tomcat10-esb.exe" //RS//tomcat10-esb). The caller still
+// applies isInteresting on top of this for status/kill filtering.
+func looksLikeJVM(p JavaProcess) bool {
+	name := strings.ToLower(p.Name)
+	if strings.HasPrefix(name, "java") { // java.exe, javaw.exe
+		return true
+	}
+	if strings.Contains(name, "tomcat") || strings.Contains(name, "catalina") {
+		return true
+	}
+	lc := strings.ToLower(p.Cmdline)
+	return strings.Contains(lc, "tomcat") || strings.Contains(lc, "catalina")
+}
+
+func filterInterestingProcesses(procs []JavaProcess) []JavaProcess {
+	var out []JavaProcess
+	for _, p := range procs {
+		if p.PID == 0 && p.Cmdline == "" {
+			continue
+		}
+		if looksLikeJVM(p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parsePowerShellCSV(s string) []JavaProcess {
@@ -69,7 +107,10 @@ func parsePowerShellCSV(s string) []JavaProcess {
 		}
 		if _, ok := header["ProcessId"]; !ok {
 			for i, f := range fields {
-				header[strings.TrimSpace(strings.TrimPrefix(f, "\""))] = i
+				// Trim BOTH quotes: TrimPrefix alone left a trailing quote
+				// on the key, so header["ProcessId"] never matched and the
+				// parser silently returned an empty list for every input.
+				header[strings.TrimSpace(strings.Trim(f, "\""))] = i
 			}
 			continue
 		}
@@ -82,10 +123,14 @@ func parsePowerShellCSV(s string) []JavaProcess {
 		if err != nil {
 			continue
 		}
-		procs = append(procs, JavaProcess{
+		jp := JavaProcess{
 			PID:     pid,
 			Cmdline: strings.Trim(strings.TrimSpace(fields[cmdIdx]), "\""),
-		})
+		}
+		if nameIdx, ok := header["Name"]; ok {
+			jp.Name = strings.Trim(strings.TrimSpace(fields[nameIdx]), "\"")
+		}
+		procs = append(procs, jp)
 	}
 	return procs
 }
@@ -164,6 +209,8 @@ func parseWmicList(s string) []JavaProcess {
 			if pid, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
 				cur.PID = pid
 			}
+		case "Name":
+			cur.Name = val
 		case "CommandLine":
 			cur.Cmdline = val
 		}

@@ -29,6 +29,12 @@ type StatusData struct {
 	TomcatExists bool          `json:"tomcat_exists"`
 	JavaProcs    []JavaProcess `json:"java_processes"`
 	Ports        []Port        `json:"listening_ports"`
+	// JavaProbeError / PortsProbeError carry the reason a probe came back
+	// empty (e.g. wmic and powershell both unavailable) instead of failing
+	// the whole action — the rest of the snapshot is still useful
+	// (2026-09-25 report: silent nulls are undebuggable).
+	JavaProbeError string `json:"java_probe_error,omitempty"`
+	PortsProbeError string `json:"ports_probe_error,omitempty"`
 	// ConfigLoadedAt is when helper last read config.json. Compare against
 	// the file's mtime on disk: a mismatch means config.json was edited
 	// after startup and a restart is required for changes to take effect
@@ -37,20 +43,14 @@ type StatusData struct {
 }
 
 func (r *Registry) status(ctx context.Context) (json.RawMessage, error) {
-	procs, err := r.probe.JavaProcesses(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("status: java processes: %w", err)
-	}
+	procs, javaErr := r.probe.JavaProcesses(ctx)
 	filtered := procs[:0]
 	for _, p := range procs {
 		if isInteresting(p, r.cfg.TomcatHome) {
 			filtered = append(filtered, p)
 		}
 	}
-	ports, err := r.probe.ListeningPorts(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("status: ports: %w", err)
-	}
+	ports, portsErr := r.probe.ListeningPorts(ctx)
 	host, _ := os.Hostname()
 	_, statErr := os.Stat(r.cfg.TomcatHome)
 	data := StatusData{
@@ -63,11 +63,28 @@ func (r *Registry) status(ctx context.Context) (json.RawMessage, error) {
 		Ports:          ports,
 		ConfigLoadedAt: r.cfg.LoadedAt.UTC(),
 	}
+	if javaErr != nil {
+		data.JavaProbeError = fmt.Sprintf("status: java processes: %v", javaErr)
+	}
+	if portsErr != nil {
+		data.PortsProbeError = fmt.Sprintf("status: ports: %v", portsErr)
+	}
 	return mustMarshal(data), nil
 }
 
 func isInteresting(p JavaProcess, tomcatHome string) bool {
+	// Never treat the helper itself as a catalina process: on dev boxes the
+	// helper runs from ...\tomcat-ops-helper\bin\helper.exe and the broad
+	// name/cmdline match below would otherwise list it.
+	if p.PID == os.Getpid() {
+		return false
+	}
 	lc := strings.ToLower(p.Cmdline)
+	if lc == "" {
+		// prunsrv-hosted JVMs may only be identifiable by image name
+		// (e.g. tomcat10-esb.exe) when CommandLine comes back empty.
+		lc = strings.ToLower(p.Name)
+	}
 	if strings.Contains(lc, "tomcat") {
 		return true
 	}
@@ -270,7 +287,7 @@ func (r *Registry) startService(ctx context.Context, params json.RawMessage) (js
 		return nil, fmt.Errorf("start_service: service %s failed to start: %s", serviceName, resultMessage(data.Start, err))
 	}
 	if err := r.waitServiceState(startCtx, serviceName, "RUNNING"); err != nil {
-		return nil, fmt.Errorf("start_service: service %s did not reach RUNNING within %s: %w", serviceName, timeout, err)
+		return nil, fmt.Errorf("start_service: service %s did not reach RUNNING within %s (sc start was accepted; the JVM may still be booting — check `sc query` / catalina log): %w", serviceName, timeout, err)
 	}
 	data.Running = true
 	return mustMarshal(data), nil
@@ -339,6 +356,13 @@ type DeployData struct {
 	StopResult    *StopServiceData  `json:"stop_result,omitempty"`
 	ReplaceResult *ReplaceJarData   `json:"replace_result,omitempty"`
 	StartResult   *StartServiceData `json:"start_result,omitempty"`
+	// StartFallback is the best-effort retry issued when the start step
+	// failed, so a deploy never leaves the service silently stopped
+	// (2026-09-25 report). FallbackError explains why the retry (also)
+	// failed; FinalState is the last observed SCM state.
+	StartFallback *StartServiceData `json:"start_fallback,omitempty"`
+	FallbackError string            `json:"fallback_error,omitempty"`
+	FinalState    string            `json:"final_state,omitempty"`
 	Error         string            `json:"error,omitempty"`
 	Step          string            `json:"step"` // which step failed
 }
@@ -354,11 +378,17 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 	if v, ok := p["restart"].(bool); ok {
 		restart = v
 	}
-	stopTimeout := r.cfg.CommandTimeout
+	// A full stop→replace→start cycle on a real box routinely exceeds
+	// cfg.CommandTimeout (30s default): catalina shutdown alone can take
+	// tens of seconds and Tomcat boots 1-2 minutes with big apps. Floor the
+	// per-step defaults well above CommandTimeout instead of inheriting it
+	// (2026-09-25 report: deploy timed out mid-cycle and left the service
+	// stopped).
+	stopTimeout := maxDuration(r.cfg.CommandTimeout, 60*time.Second)
 	if v, ok := p["stop_timeout"].(float64); ok && v > 0 {
 		stopTimeout = time.Duration(v * float64(time.Second))
 	}
-	startTimeout := stopTimeout
+	startTimeout := maxDuration(r.cfg.CommandTimeout, 180*time.Second)
 	if v, ok := p["start_timeout"].(float64); ok && v > 0 {
 		startTimeout = time.Duration(v * float64(time.Second))
 	}
@@ -366,6 +396,20 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 	serviceName := r.discoverWindowsServiceName(ctx)
 	if serviceName != "" {
 		data.ServiceName = serviceName
+	}
+	// finish stamps the final observed service state and marshals. Every
+	// exit path goes through it so the caller always learns where the
+	// service ended up (a plain defer would run after the return value —
+	// here mustMarshal(data) — is already evaluated).
+	finish := func() (json.RawMessage, error) {
+		if serviceName != "" {
+			stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if state, err := r.queryServiceState(stateCtx, serviceName); err == nil {
+				data.FinalState = state
+			}
+		}
+		return mustMarshal(data), nil
 	}
 
 	// Step 1: stop the service
@@ -375,7 +419,7 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 	if stopErr != nil {
 		data.Error = stopErr.Error()
 		data.Step = "stop_service"
-		return mustMarshal(data), nil // return partial result, not error
+		return finish() // return partial result, not error
 	}
 	var stopData StopServiceData
 	if jsonErr := json.Unmarshal(stopRaw, &stopData); jsonErr == nil {
@@ -388,7 +432,7 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 		if replaceErr != nil {
 			data.Error = replaceErr.Error()
 			data.Step = "replace_jar"
-			return mustMarshal(data), nil
+			return finish()
 		}
 		var replaceData ReplaceJarData
 		if jsonErr := json.Unmarshal(replaceRaw, &replaceData); jsonErr == nil {
@@ -403,14 +447,86 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 	if startErr != nil {
 		data.Error = startErr.Error()
 		data.Step = "start_service"
-		return mustMarshal(data), nil
+		// Fallback: never leave the box in "stopped, gave up" without one
+		// more attempt. The retry is state-aware — if the service is
+		// already RUNNING or still START_PENDING we must not blindly
+		// re-issue sc start ("instance already running").
+		fbCtx, fbCancel := context.WithTimeout(context.WithoutCancel(ctx), startTimeout)
+		defer fbCancel()
+		fb, fbErr := r.fallbackStart(fbCtx, serviceName, startTimeout)
+		if fb != nil {
+			data.StartFallback = fb
+		}
+		if fbErr != "" {
+			data.FallbackError = fbErr
+		}
+		return finish()
 	}
 	var startData StartServiceData
 	if jsonErr := json.Unmarshal(startRaw, &startData); jsonErr == nil {
 		data.StartResult = &startData
 	}
 
-	return mustMarshal(data), nil
+	return finish()
+}
+
+// fallbackStart makes one state-aware best-effort attempt to leave the
+// Windows service RUNNING after a failed start step. It returns the
+// StartServiceData of the attempt (nil when it could not even try) and an
+// error string explaining the outcome.
+func (r *Registry) fallbackStart(ctx context.Context, serviceName string, timeout time.Duration) (*StartServiceData, string) {
+	if serviceName == "" {
+		return nil, "cannot determine Windows service name for fallback start"
+	}
+	state, err := r.queryServiceState(ctx, serviceName)
+	if err != nil {
+		return nil, "fallback: " + err.Error()
+	}
+	switch state {
+	case "RUNNING":
+		return &StartServiceData{ServiceName: serviceName, Running: true}, ""
+	case "START_PENDING", "CONTINUE_PENDING":
+		if werr := r.waitServiceState(ctx, serviceName, "RUNNING"); werr == nil {
+			return &StartServiceData{ServiceName: serviceName, Running: true}, ""
+		}
+		return &StartServiceData{ServiceName: serviceName},
+			fmt.Sprintf("fallback: service still %s after %s", state, timeout)
+	default: // STOPPED / STOP_PENDING / PAUSED → safe to (re)start
+		raw, serr := r.startService(ctx, mustMarshal(map[string]any{"timeout": float64(timeout.Seconds())}))
+		if serr != nil {
+			return nil, "fallback start: " + serr.Error()
+		}
+		var d StartServiceData
+		if jsonErr := json.Unmarshal(raw, &d); jsonErr != nil {
+			return &StartServiceData{ServiceName: serviceName}, ""
+		}
+		return &d, ""
+	}
+}
+
+// queryServiceState parses the STATE line out of `sc query` output, e.g.
+// "STATE              : 4  RUNNING" → "RUNNING".
+func (r *Registry) queryServiceState(ctx context.Context, serviceName string) (string, error) {
+	q, err := r.executor.Exec(ctx, fmt.Sprintf("sc query %q", serviceName), r.cfg.TomcatHome)
+	if err != nil {
+		return "", fmt.Errorf("sc query %s: %w", serviceName, err)
+	}
+	if q.ExitCode != 0 {
+		return "", fmt.Errorf("sc query %s: exit_code=%d %s", serviceName, q.ExitCode, strings.TrimSpace(q.Stdout+" "+q.Stderr))
+	}
+	re := regexp.MustCompile(`(?im)^\s*STATE\s*:\s*\d+\s+(\S+)`)
+	m := re.FindStringSubmatch(q.Stdout + "\n" + q.Stderr)
+	if m == nil {
+		return "", fmt.Errorf("sc query %s: no STATE line in output", serviceName)
+	}
+	return strings.ToUpper(m[1]), nil
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // RestartData is the JSON returned by "restart".

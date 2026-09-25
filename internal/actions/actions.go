@@ -48,6 +48,7 @@ type Probe interface {
 type JavaProcess struct {
 	PID     int    `json:"pid"`
 	User    string `json:"user,omitempty"`
+	Name    string `json:"name,omitempty"` // process image name, e.g. java.exe or a prunsrv service binary
 	Cmdline string `json:"cmdline"`
 	Main    string `json:"main,omitempty"`
 }

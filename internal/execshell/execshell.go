@@ -50,7 +50,14 @@ type AuditEntry struct {
 // blacklist contains patterns we refuse to run regardless of context.
 var blacklist = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\brm\s+-rf\s+/`),
-	regexp.MustCompile(`(?i)\bformat\b`),
+	// `format` only counts as a command token: preceded by start of string,
+	// whitespace, a shell separator or a quote/path separator, and followed
+	// by whitespace, a quote or end of string. A bare \bformat\b also ate
+	// PowerShell's Format-Table / Format-List (2026-09-25 report) because
+	// the hyphen after "format" is a word boundary.
+	regexp.MustCompile(`(?i)(?:^|[\s&;|(\\/"'])format(?:\.com|\.exe)?(?:[\s"']|$)`),
+	// The one formatting cmdlet that actually destroys data.
+	regexp.MustCompile(`(?i)\bformat-volume\b`),
 	regexp.MustCompile(`(?i)\bshutdown(\.exe)?\s+(/[a-zA-Z]|\-[a-zA-Z])`),
 	regexp.MustCompile(`(?i)\bcurl\b[^\n|]*\|\s*bash\b`),
 	regexp.MustCompile(`(?i)\bwget\b[^\n|]*\|\s*bash\b`),

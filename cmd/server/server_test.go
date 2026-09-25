@@ -228,3 +228,46 @@ func TestHandleMcpCall_RejectsBadJSONRPC(t *testing.T) {
 		t.Fatalf("expected error for jsonrpc != 2.0, got %+v", resp)
 	}
 }
+
+// TestUnregister_FailsPendingCallsOfThatClient ensures a helper disconnect
+// resolves that helper's in-flight calls immediately with a synthetic
+// error instead of parking the HTTP caller for the full (now 300s) default
+// call timeout (2026-09-25 report follow-up).
+func TestUnregister_FailsPendingCallsOfThatClient(t *testing.T) {
+	r := newTestRelay(t)
+	mine := make(chan protocol.Result, 1)
+	other := make(chan protocol.Result, 1)
+	r.mu.Lock()
+	r.pending["cmd-1"] = pendingCall{ch: mine, clientID: "c-1"}
+	r.pending["cmd-2"] = pendingCall{ch: other, clientID: "c-2"}
+	r.mu.Unlock()
+
+	r.unregister(&wsserver.Client{ID: "c-1"})
+
+	select {
+	case res := <-mine:
+		if res.Success {
+			t.Fatal("synthetic result must not be success")
+		}
+		if res.Error != "helper disconnected before result" {
+			t.Fatalf("unexpected synthetic error: %q", res.Error)
+		}
+	default:
+		t.Fatal("expected pending call of the disconnected helper to be resolved")
+	}
+	select {
+	case <-other:
+		t.Fatal("pending call of another helper must be left alone")
+	default:
+	}
+	r.mu.Lock()
+	_, ok1 := r.pending["cmd-1"]
+	_, ok2 := r.pending["cmd-2"]
+	r.mu.Unlock()
+	if ok1 {
+		t.Fatal("cmd-1 should have been removed from pending")
+	}
+	if !ok2 {
+		t.Fatal("cmd-2 should still be pending")
+	}
+}

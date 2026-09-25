@@ -40,7 +40,7 @@ func coreTools() []Tool {
 		{Name: "replace_text", Description: "Atomically replace literal text in an existing UTF-8 file in allowed_dirs, up to 1 MiB. Preserves BOM and line endings. Default expected_count=1; mismatch leaves file unchanged. Optional expected_sha256 checks the version read earlier.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"expected_count":{"type":"integer","minimum":1},"expected_sha256":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}`)},
 		{
 			Name:        "status",
-			Description: "Return hostname, OS, Tomcat home existence, JVM processes (filtered to Tomcat/catalina), and listening TCP ports.",
+			Description: "Return hostname, OS, Tomcat home existence, JVM processes (filtered to Tomcat/catalina, including prunsrv-hosted service JVMs such as tomcat10-esb.exe), and listening TCP ports. If a probe fails, its section stays empty and the reason is reported in java_probe_error / ports_probe_error instead of failing the whole call.",
 			InputSchema: emptyObjectSchema,
 		},
 		{
@@ -70,7 +70,7 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "deploy",
-			Description: "Full deploy cycle: stop_service → wait for catalina exit → replace_jar → start_service. Use this one-shot action instead of manually calling stop/replace/start. Requires src and dest for the jar, plus optional stop_timeout/start_timeout.",
+			Description: "Full deploy cycle: stop_service → wait for catalina exit → replace_jar → start_service. Use this one-shot action instead of manually calling stop/replace/start. Returns per-step results (stop_result / replace_result / start_result), the final service state (final_state), and — if the start step fails — one state-aware fallback start attempt (start_fallback) so the service is never silently left stopped. Requires src and dest for the jar, plus optional stop_timeout/start_timeout.",
 			InputSchema: deploySchema,
 		},
 		{
@@ -191,8 +191,8 @@ var deploySchema = json.RawMessage(`{
 		"src":{"type":"string","description":"Source jar path; must be under allowed_dirs."},
 		"dest":{"type":"string","description":"Destination jar path; must be under allowed_dirs."},
 		"restart":{"type":"boolean","description":"If true (default), also stop and start the service around the jar replacement."},
-		"stop_timeout":{"type":"integer","description":"Timeout in seconds for stop_service step.","minimum":1},
-		"start_timeout":{"type":"integer","description":"Timeout in seconds for start_service step.","minimum":1}
+		"stop_timeout":{"type":"integer","description":"Timeout in seconds for stop_service step. Default max(cfg.command_timeout, 60s) — a real catalina shutdown takes longer than the 30s command default.","minimum":1},
+		"start_timeout":{"type":"integer","description":"Timeout in seconds for start_service step (and for the fallback start on failure). Default max(cfg.command_timeout, 180s) — Tomcat boots slower than the command default.","minimum":1}
 	},
 	"required":["src","dest"],
 	"additionalProperties":false

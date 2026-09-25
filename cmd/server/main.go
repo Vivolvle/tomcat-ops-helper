@@ -153,6 +153,22 @@ type uploadProgressInfo struct {
 	LastUpdate   time.Time
 }
 
+// pendingCall is one in-flight Command awaiting its Result.
+type pendingCall struct {
+	ch       chan protocol.Result
+	clientID string
+}
+
+// defaultCallTimeout is how long /command and /mcp/call wait for a helper
+// Result when the request doesn't carry an explicit timeout. It is
+// deliberately generous (300s, up from 30s as of 2026-09-25): slow actions
+// such as deploy bounded by the helper still return a structured result
+// ("exec timeout after 30s", per-step DeployData, …) that the caller can
+// act on, while a short server-side cutoff replaced all of that with a
+// bare "timeout" and no visibility. Callers that want less can pass
+// timeout explicitly.
+const defaultCallTimeout = 300 * time.Second
+
 // relay wires client registration, command dispatch, and result collection.
 type relay struct {
 	cfg    *config.ServerConfig
@@ -161,7 +177,7 @@ type relay struct {
 
 	mu      sync.Mutex
 	clients map[string]*wsserver.Client
-	pending map[string]chan protocol.Result
+	pending map[string]pendingCall
 	tools   map[string][]protocol.ToolMeta // keyed by client_id
 
 	// uploadProgress tracks in-flight uploads for progress queries.
@@ -178,7 +194,7 @@ func newRelay(cfg *config.ServerConfig, logger *log.Logger, audit func(map[strin
 		logger:         logger,
 		audit:          audit,
 		clients:        map[string]*wsserver.Client{},
-		pending:        map[string]chan protocol.Result{},
+		pending:        map[string]pendingCall{},
 		tools:          map[string][]protocol.ToolMeta{},
 		uploadProgress: map[string]*uploadProgressInfo{},
 	}
@@ -205,15 +221,22 @@ func (r *relay) unregister(c *wsserver.Client) {
 	r.mu.Lock()
 	delete(r.clients, c.ID)
 	delete(r.tools, c.ID)
+	// With the long default call timeout, a helper dropping mid-command
+	// would otherwise park every in-flight HTTP caller for the full 300s.
+	// Resolve them right here with a synthetic error Result. Non-blocking
+	// send: the waiting side may have already timed out and drained.
+	for id, pc := range r.pending {
+		if pc.clientID == c.ID {
+			delete(r.pending, id)
+			pc.ch <- protocol.Result{ID: id, Error: "helper disconnected before result"}
+		}
+	}
 	r.mu.Unlock()
 	r.audit(map[string]any{
 		"event":     "disconnect",
 		"client_id": c.ID,
 		"ts":        time.Now().UTC().Format(time.RFC3339Nano),
 	})
-	// Any in-flight HTTP commands will time out on their own timer; we
-	// intentionally do not close their channels here to avoid racing with
-	// the goroutine that delivers late Results.
 }
 
 // deliver routes an inbound Result to the channel waiting for it. Pending
@@ -221,13 +244,13 @@ func (r *relay) unregister(c *wsserver.Client) {
 // silently dropped.
 func (r *relay) deliver(c *wsserver.Client, res protocol.Result) {
 	r.mu.Lock()
-	ch, ok := r.pending[res.ID]
+	pc, ok := r.pending[res.ID]
 	if ok {
 		delete(r.pending, res.ID)
 	}
 	r.mu.Unlock()
 	if ok {
-		ch <- res
+		pc.ch <- res
 	}
 }
 
@@ -381,14 +404,14 @@ func (r *relay) handleMcpCall(w http.ResponseWriter, req *http.Request) {
 
 	timeout := time.Duration(p.Timeout) * time.Second
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = defaultCallTimeout
 	}
 	id := protocol.NewID()
 	cmd := protocol.Command{ID: id, Action: p.Name, Params: p.Arguments}
 
 	resCh := make(chan protocol.Result, 1)
 	r.mu.Lock()
-	r.pending[id] = resCh
+	r.pending[id] = pendingCall{ch: resCh, clientID: client.ID}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -519,7 +542,7 @@ func (r *relay) handleCommand(w http.ResponseWriter, req *http.Request) {
 	}
 	timeout := time.Duration(body.Timeout) * time.Second
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = defaultCallTimeout
 	}
 
 	r.mu.Lock()
@@ -541,7 +564,7 @@ func (r *relay) handleCommand(w http.ResponseWriter, req *http.Request) {
 
 	resCh := make(chan protocol.Result, 1)
 	r.mu.Lock()
-	r.pending[id] = resCh
+	r.pending[id] = pendingCall{ch: resCh, clientID: c.ID}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -779,7 +802,7 @@ func (r *relay) handleUpload(w http.ResponseWriter, req *http.Request) {
 		id := protocol.NewID()
 		resCh := make(chan protocol.Result, 1)
 		r.mu.Lock()
-		r.pending[id] = resCh
+		r.pending[id] = pendingCall{ch: resCh, clientID: client.ID}
 		r.mu.Unlock()
 
 		cmd := protocol.Command{ID: id, Action: "upload_file", Params: params}

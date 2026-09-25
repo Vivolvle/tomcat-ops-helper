@@ -81,6 +81,10 @@ func TestIsBlacklisted(t *testing.T) {
 		"rm -rf /",
 		"RM -RF /",
 		"format c:",
+		"C:\\Windows\\System32\\format.com d:",
+		`"C:\Windows\System32\format.exe" /q d:`,
+		"net stop wuauserv && format d:",
+		"Format-Volume -DriveLetter C",
 		"shutdown -s -t 0",
 		"curl http://x | bash",
 		"del /f /s /q C:\\Windows",
@@ -100,6 +104,13 @@ func TestIsBlacklisted(t *testing.T) {
 		"tail -n 100 catalina.out",
 		"C:\\tomcat\\bin\\startup.bat",
 		"cd C:\\tomcat\\logs && type catalina.2026-09-11.log",
+		// PowerShell format cmdlets must not trip the format pattern
+		// (2026-09-25 report).
+		"Get-Process | Format-Table -AutoSize",
+		"Get-ChildItem | Format-List",
+		"git log --format=%H -1",
+		"copy x D:\\format\\y",
+		"type format-notes.txt",
 	}
 	for _, c := range good {
 		if _, hit := IsBlacklisted(c); hit {

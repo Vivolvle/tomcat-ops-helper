@@ -74,14 +74,17 @@ type Bridge struct {
 	lastFingerprint string
 }
 
-// NewBridge returns a Bridge wired with sensible defaults: a 60s HTTP client
-// and the project's standard server identity. Override fields directly after
+// NewBridge returns a Bridge wired with sensible defaults: a 330s HTTP client
+// and the project's standard server identity. The client timeout must
+// outlast server.exe's 300s default call wait, otherwise the bridge cuts a
+// slow tools/call (e.g. deploy) short and turns a structured result into a
+// bare 60s timeout (2026-09-25 report). Override fields directly after
 // construction if you need different behavior in tests.
 func NewBridge(rawURL, clientID string) *Bridge {
 	return &Bridge{
 		URL:           strings.TrimRight(rawURL, "/"),
 		ClientID:      clientID,
-		HTTP:          &http.Client{Timeout: 60 * time.Second},
+		HTTP:          &http.Client{Timeout: 330 * time.Second},
 		serverName:    "tomcat-ops-helper-bridge",
 		serverVersion: "0.1.0",
 		PollInterval:  defaultPollInterval,

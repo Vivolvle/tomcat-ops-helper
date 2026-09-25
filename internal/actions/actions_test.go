@@ -20,8 +20,10 @@ import (
 
 // fakeProbe is a plug-in for the OS Probe; tests can seed it with canned data.
 type fakeProbe struct {
-	procs []JavaProcess
-	ports []Port
+	procs    []JavaProcess
+	ports    []Port
+	javaErr  error
+	portsErr error
 }
 
 type captureRunner struct {
@@ -36,10 +38,54 @@ func (f *captureRunner) Run(_ context.Context, name string, args []string, _ str
 }
 
 func (f *fakeProbe) JavaProcesses(context.Context) ([]JavaProcess, error) {
-	return f.procs, nil
+	return f.procs, f.javaErr
 }
 func (f *fakeProbe) ListeningPorts(context.Context) ([]Port, error) {
-	return f.ports, nil
+	return f.ports, f.portsErr
+}
+
+// scriptRule is one scripted response for scriptRunner. The first rule whose
+// match substring appears in the full command line wins; stdouts is consumed
+// one entry per hit (the last entry repeats) and failFirst makes the first N
+// hits fail with exit 1 + stderr.
+type scriptRule struct {
+	match    string
+	stdouts  []string
+	stderr   string
+	failFirst int
+	hits     int
+}
+
+// scriptRunner fakes execshell.Runner for tests that drive the sc command
+// family. It records every full command line for assertions.
+type scriptRunner struct {
+	calls []string
+	rules []scriptRule
+}
+
+func (s *scriptRunner) Run(_ context.Context, name string, args []string, _ string) (execshell.Result, error) {
+	full := name + " " + strings.Join(args, " ")
+	s.calls = append(s.calls, full)
+	for i := range s.rules {
+		r := &s.rules[i]
+		if !strings.Contains(full, r.match) {
+			continue
+		}
+		r.hits++
+		stdout := ""
+		if len(r.stdouts) > 0 {
+			idx := r.hits - 1
+			if idx >= len(r.stdouts) {
+				idx = len(r.stdouts) - 1
+			}
+			stdout = r.stdouts[idx]
+		}
+		if r.failFirst > 0 && r.hits <= r.failFirst {
+			return execshell.Result{ExitCode: 1, Stdout: stdout, Stderr: r.stderr}, nil
+		}
+		return execshell.Result{ExitCode: 0, Stdout: stdout}, nil
+	}
+	return execshell.Result{ExitCode: 0}, nil
 }
 
 func mustExec(t *testing.T) *execshell.Executor {
@@ -1273,5 +1319,203 @@ func TestReplaceJar_WithRestartFalse_ReturnsDataWithoutRestartFields(t *testing.
 	}
 	if got.RestartData != nil {
 		t.Fatal("restart=false should not set RestartData")
+	}
+}
+
+// TestStatus_ReportsProbeErrors ensures status degrades gracefully when a
+// probe fails: the section stays empty but the reason is surfaced in
+// java_probe_error / ports_probe_error instead of failing the whole call
+// (2026-09-25 report: silent nulls are undebuggable).
+func TestStatus_ReportsProbeErrors(t *testing.T) {
+	cfg := mustCfg(t)
+	probe := &fakeProbe{
+		javaErr:  errors.New("wmic: not found"),
+		portsErr: errors.New("netstat: boom"),
+	}
+	reg := NewRegistry(cfg, mustExec(t)).WithProbe(probe)
+	raw, err := reg.status(context.Background())
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	var got StatusData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.JavaProbeError == "" || !strings.Contains(got.JavaProbeError, "wmic") {
+		t.Fatalf("expected java_probe_error with reason, got %q", got.JavaProbeError)
+	}
+	if got.PortsProbeError == "" || !strings.Contains(got.PortsProbeError, "netstat") {
+		t.Fatalf("expected ports_probe_error with reason, got %q", got.PortsProbeError)
+	}
+	if got.JavaProcs != nil || got.Ports != nil {
+		t.Fatalf("expected nil probe sections, got %+v / %+v", got.JavaProcs, got.Ports)
+	}
+	if !got.TomcatExists {
+		t.Fatal("tomcat_exists should still be reported")
+	}
+}
+
+// TestJavaProcessesWindows_ParserIncludesPrunsrvServiceProcess covers the
+// 2026-09-25 report: Tomcat installed as a Windows service with procrun
+// StartMode=jvm runs the JVM inside the renamed service binary
+// (tomcat10-esb.exe), so enumeration must not filter on java.exe alone.
+func TestJavaProcessesWindows_ParserIncludesPrunsrvServiceProcess(t *testing.T) {
+	wmicOut := "CommandLine=D:\\bs-esb\\apache-tomcat-10.1.59\\bin\\tomcat10-esb.exe //RS//tomcat10-esb\r\n" +
+		"Name=tomcat10-esb.exe\r\n" +
+		"ProcessId=4242\r\n" +
+		"\r\n" +
+		"CommandLine=C:\\jdk\\bin\\java -Dcatalina.home=D:\\tomcat org.apache.catalina.startup.Bootstrap\r\n" +
+		"Name=java.exe\r\n" +
+		"ProcessId=1111\r\n" +
+		"\r\n" +
+		"CommandLine=C:\\Windows\\explorer.exe\r\n" +
+		"Name=explorer.exe\r\n" +
+		"ProcessId=2222\r\n" +
+		"\r\n"
+	procs := filterInterestingProcesses(parseWmicList(wmicOut))
+	if len(procs) != 2 {
+		t.Fatalf("expected 2 kept processes (prunsrv + java), got %d: %+v", len(procs), procs)
+	}
+	pids := map[int]bool{}
+	for _, p := range procs {
+		pids[p.PID] = true
+	}
+	if !pids[4242] || !pids[1111] || pids[2222] {
+		t.Fatalf("wrong process set kept: %+v", procs)
+	}
+
+	csvOut := "\"ProcessId\",\"Name\",\"CommandLine\"\n" +
+		"\"4242\",\"tomcat10-esb.exe\",\"D:\\bs-esb\\bin\\tomcat10-esb.exe //RS//tomcat10-esb\"\n" +
+		"\"2222\",\"explorer.exe\",\"C:\\Windows\\explorer.exe\"\n"
+	csvProcs := filterInterestingProcesses(parsePowerShellCSV(csvOut))
+	if len(csvProcs) != 1 || csvProcs[0].PID != 4242 || csvProcs[0].Name != "tomcat10-esb.exe" {
+		t.Fatalf("CSV parse kept wrong set: %+v", csvProcs)
+	}
+}
+
+// TestIsInteresting_NameOnlyPrunsrvProcess ensures a prunsrv-hosted JVM with
+// an empty CommandLine is still matched via its image name.
+func TestIsInteresting_NameOnlyPrunsrvProcess(t *testing.T) {
+	p := JavaProcess{PID: 99, Name: "Tomcat10-ESB.exe"}
+	if !isInteresting(p, "D:\\tomcat") {
+		t.Fatal("prunsrv image name should be interesting")
+	}
+	if isInteresting(JavaProcess{PID: 1, Name: "explorer.exe"}, "") {
+		t.Fatal("explorer should not be interesting")
+	}
+}
+
+// TestDeploy_StartFailureAttemptsFallbackAndRecovers covers the 2026-09-25
+// report: when the start step fails, deploy must make one state-aware
+// fallback attempt so the service does not stay silently stopped. First
+// sc start fails; the fallback sees STOPPED, restarts, and reaches RUNNING.
+func TestDeploy_StartFailureAttemptsFallbackAndRecovers(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.ServiceName = "Tomcat10ESB"
+	seedDeployJars(t, cfg)
+
+	runner := &scriptRunner{rules: []scriptRule{
+		{match: `sc stop "Tomcat10ESB"`},
+		// sc query hits: (1) fallback state check → STOPPED,
+		// (2) waitServiceState in the retry → RUNNING, (3+) final state.
+		{match: `sc query "Tomcat10ESB"`, stdouts: []string{
+			"SERVICE_NAME: Tomcat10ESB\n        STATE              : 1  STOPPED\n",
+			"SERVICE_NAME: Tomcat10ESB\n        STATE              : 4  RUNNING\n",
+		}},
+		{match: `sc start "Tomcat10ESB"`, failFirst: 1, stderr: "The service did not respond."},
+	}}
+	exec := execshell.NewExecutor(cfg).WithRunner(runner)
+	reg := NewRegistry(cfg, exec).WithProbe(&fakeProbe{})
+
+	raw, err := reg.deploy(context.Background(), mustMarshal(map[string]any{
+		"src":  filepath.Join(cfg.TomcatHome, "uploads", "app.jar"),
+		"dest": filepath.Join(cfg.TomcatHome, "webapps", "app.jar"),
+	}))
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	var got DeployData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Step != "start_service" {
+		t.Fatalf("expected step=start_service, got %q", got.Step)
+	}
+	if got.Error == "" {
+		t.Fatal("original start error must be reported")
+	}
+	if got.StartFallback == nil || !got.StartFallback.Running {
+		t.Fatalf("expected recovered fallback (Running=true), got %+v (fallback_error=%q)", got.StartFallback, got.FallbackError)
+	}
+	if got.FallbackError != "" {
+		t.Fatalf("unexpected fallback_error: %q", got.FallbackError)
+	}
+	if got.FinalState != "RUNNING" {
+		t.Fatalf("expected final_state=RUNNING, got %q", got.FinalState)
+	}
+	// Replace must still have happened.
+	if got.ReplaceResult == nil || got.ReplaceResult.Bytes == 0 {
+		t.Fatalf("expected replace_result with bytes, got %+v", got.ReplaceResult)
+	}
+}
+
+// TestDeploy_FallbackAlsoFailsReportsIt ensures that when the fallback start
+// also fails, deploy reports why instead of pretending everything is fine.
+func TestDeploy_FallbackAlsoFailsReportsIt(t *testing.T) {
+	cfg := mustCfg(t)
+	cfg.ServiceName = "Tomcat10ESB"
+	seedDeployJars(t, cfg)
+
+	runner := &scriptRunner{rules: []scriptRule{
+		{match: `sc stop "Tomcat10ESB"`},
+		{match: `sc query "Tomcat10ESB"`, stdouts: []string{
+			"SERVICE_NAME: Tomcat10ESB\n        STATE              : 1  STOPPED\n",
+		}},
+		{match: `sc start "Tomcat10ESB"`, stderr: "start refused", failFirst: 1000},
+	}}
+	exec := execshell.NewExecutor(cfg).WithRunner(runner)
+	reg := NewRegistry(cfg, exec).WithProbe(&fakeProbe{})
+
+	raw, err := reg.deploy(context.Background(), mustMarshal(map[string]any{
+		"src":  filepath.Join(cfg.TomcatHome, "uploads", "app.jar"),
+		"dest": filepath.Join(cfg.TomcatHome, "webapps", "app.jar"),
+	}))
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	var got DeployData
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Step != "start_service" || got.Error == "" {
+		t.Fatalf("expected start failure recorded, got step=%q error=%q", got.Step, got.Error)
+	}
+	if got.StartFallback != nil {
+		t.Fatalf("expected no fallback data on hard failure, got %+v", got.StartFallback)
+	}
+	if got.FallbackError == "" {
+		t.Fatal("fallback failure must be reported in fallback_error")
+	}
+	if got.FinalState != "STOPPED" {
+		t.Fatalf("expected final_state=STOPPED, got %q", got.FinalState)
+	}
+}
+
+// seedDeployJars creates the src/dest jar pair deploy tests copy around.
+func seedDeployJars(t *testing.T, cfg *config.HelperConfig) {
+	t.Helper()
+	src := filepath.Join(cfg.TomcatHome, "uploads", "app.jar")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatalf("mkdir uploads: %v", err)
+	}
+	if err := os.WriteFile(src, []byte("NEW-JAR"), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	dst := filepath.Join(cfg.TomcatHome, "webapps", "app.jar")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		t.Fatalf("mkdir webapps: %v", err)
+	}
+	if err := os.WriteFile(dst, []byte("OLD-JAR"), 0o644); err != nil {
+		t.Fatalf("write dst: %v", err)
 	}
 }
