@@ -70,6 +70,7 @@ type Status struct {
 	Port          int        `json:"port,omitempty"`
 	Database      string     `json:"database,omitempty"`
 	CurrentSchema string     `json:"current_schema,omitempty"`
+	ReadOnly      bool       `json:"read_only,omitempty"` // forbid_cmd lock is active
 	LatencyMs     int64      `json:"latency_ms,omitempty"`
 	LastError     string     `json:"last_error,omitempty"`
 	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
@@ -131,6 +132,7 @@ type RunScriptResult struct {
 	Driver        string            `json:"driver"`
 	Database      string            `json:"database,omitempty"`
 	CurrentSchema string            `json:"current_schema,omitempty"`
+	ReadOnly      bool              `json:"read_only,omitempty"` // forbid_cmd lock is active
 	Statements    []StatementResult `json:"statements"`
 	TotalTookMs   int64             `json:"total_took_ms"`
 	Truncated     bool              `json:"truncated,omitempty"`
@@ -173,6 +175,7 @@ func RunScript(ctx context.Context, op Op, script string, maxRows int, perStatem
 		res.Driver = s.Driver
 		res.Database = s.Database
 		res.CurrentSchema = s.CurrentSchema
+		res.ReadOnly = s.ReadOnly
 	}
 
 	stmts := SplitScriptForDriver(script, res.Driver)

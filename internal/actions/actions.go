@@ -35,6 +35,7 @@ type Registry struct {
 	probe    Probe
 	uploads  *uploadRegistry
 	dbops    map[string]dbop.Op // keyed by tool name ("esb_db_operator", "erp_db_operator")
+	tasks    *taskRegistry      // long-running composite actions (deploy) for task_status polling
 }
 
 // Probe abstracts OS-level introspection. Production uses OSProbe; tests
@@ -68,6 +69,7 @@ func NewRegistry(cfg *config.HelperConfig, exec *execshell.Executor) *Registry {
 		probe:    NewOSProbe(),
 		uploads:  newUploadRegistry(),
 		dbops:    map[string]dbop.Op{},
+		tasks:    newTaskRegistry(),
 	}
 }
 
@@ -115,6 +117,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.deploy(ctx, params)
 	case "wait_for_catalina":
 		return r.waitCatalina(ctx, params)
+	case "task_status":
+		return r.taskStatus(ctx, params)
 	case "replace_jar":
 		return r.replaceJar(ctx, params)
 	case "kill_zombie":
@@ -337,6 +341,7 @@ func (r *Registry) dbOperator(ctx context.Context, toolName string, params json.
 		res.Database = st.Database
 	}
 	res.CurrentSchema = st.CurrentSchema
+	res.ReadOnly = st.ReadOnly
 	return mustMarshal(res), nil
 }
 

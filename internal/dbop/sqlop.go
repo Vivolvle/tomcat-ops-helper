@@ -32,6 +32,11 @@ type SQLOp struct {
 	tlsMin         string
 	trustCert      bool
 	hostnameInCert string
+	// forbidCmd locks the connector to read-only (config.json
+	// "forbid_cmd": true). Enforced in Exec / Query before any driver
+	// call, so a locked connector can never reach the database with a
+	// data-changing statement regardless of which code path calls in.
+	forbidCmd bool
 
 	mu     sync.Mutex
 	db     *sql.DB
@@ -66,12 +71,14 @@ func NewSQLOp(ctx context.Context, cfg *config.DBConfig) (*SQLOp, error) {
 		tlsMin:         cfg.TLSMin,
 		trustCert:      cfg.TrustCert,
 		hostnameInCert: cfg.HostnameInCert,
+		forbidCmd:      cfg.ForbidCmd,
 		status: Status{
 			Configured: true,
 			Driver:     driver,
 			Host:       host,
 			Port:       port,
 			Database:   database,
+			ReadOnly:   cfg.ForbidCmd,
 		},
 		open:   sql.Open,
 		pingTO: 5 * time.Second,
@@ -109,6 +116,9 @@ func (o *SQLOp) Status(ctx context.Context) Status {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// Keep the lock flag honest even for ops constructed directly in
+	// tests (NewSQLOp already seeds it at build time).
+	o.status.ReadOnly = o.forbidCmd
 	if o.db != nil {
 		pingCtx, cancel := context.WithTimeout(ctx, o.pingTO)
 		start := time.Now()
@@ -130,8 +140,24 @@ func (o *SQLOp) Status(ctx context.Context) Status {
 	return o.status
 }
 
+// ReadOnly reports whether this connector is locked read-only by
+// config.json forbid_cmd. Pure accessor — used by the tool-description
+// builder to flag locked connectors in the advertised tool list, without
+// pinging anything.
+func (o *SQLOp) ReadOnly() bool { return o.forbidCmd }
+
 // Query runs one SELECT statement with row-size + row-count safety.
+// On a forbid_cmd connector every statement must additionally pass
+// checkReadOnlyQuery — the router's WITH / VALUES allowance is a
+// smuggling vector there (WITH … DELETE is valid MySQL 8 / SQL Server).
 func (o *SQLOp) Query(ctx context.Context, sqlText string, maxRows int) (QueryResult, error) {
+	if o.forbidCmd {
+		// Policy rejection: deliberately not recorded in status.LastError
+		// (the connector itself is fine) and not retried.
+		if err := checkReadOnlyQuery(sqlText); err != nil {
+			return QueryResult{}, err
+		}
+	}
 	if maxRows <= 0 {
 		maxRows = DefaultMaxRows
 	}
@@ -156,8 +182,14 @@ func (o *SQLOp) Query(ctx context.Context, sqlText string, maxRows int) (QueryRe
 	return qr, err
 }
 
-// Exec runs one non-SELECT statement.
+// Exec runs one non-SELECT statement. On a forbid_cmd connector it is
+// refused outright, before any connection is borrowed — a locked
+// connector must not be able to reach the database with DML / DDL at
+// all, no matter how the statement was routed.
 func (o *SQLOp) Exec(ctx context.Context, sqlText string) (ExecResult, error) {
+	if o.forbidCmd {
+		return ExecResult{}, ErrForbidCmd
+	}
 	er, err := o.runExec(ctx, sqlText)
 	if err != nil && isRetryable(err) {
 		// Never replay a write automatically: the server may have committed

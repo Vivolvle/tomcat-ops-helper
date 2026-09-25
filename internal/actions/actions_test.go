@@ -49,11 +49,11 @@ func (f *fakeProbe) ListeningPorts(context.Context) ([]Port, error) {
 // one entry per hit (the last entry repeats) and failFirst makes the first N
 // hits fail with exit 1 + stderr.
 type scriptRule struct {
-	match    string
-	stdouts  []string
-	stderr   string
+	match     string
+	stdouts   []string
+	stderr    string
 	failFirst int
-	hits     int
+	hits      int
 }
 
 // scriptRunner fakes execshell.Runner for tests that drive the sc command

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,6 +256,60 @@ func TestLoadHelper_DBConfig_Enabled(t *testing.T) {
 			}
 			if got != tc.enabled {
 				t.Fatalf("IsEnabled=%v, want %v", got, tc.enabled)
+			}
+		})
+	}
+}
+
+// TestLoadHelper_DBConfig_ForbidCmd covers the read-only lock flag:
+// absent → false (writes allowed, nothing to maintain), explicit true
+// on either connector → surfaced on DBConfig for the dbop layer.
+func TestLoadHelper_DBConfig_ForbidCmd(t *testing.T) {
+	base := `{
+		"server_url":"wss://x","token":"longenough",
+		"tomcat_home":"C:\\t","jdk_home":"C:\\j","log_dir":"C:\\t\\l","allowed_dirs":["C:\\t"],
+		%s
+	}`
+	cases := []struct {
+		name string
+		body string
+		esb  bool
+		erp  bool
+	}{
+		{
+			name: "unset defaults to false on both",
+			body: `"esb":{"host":"db","user":"u","password":"p","database":"d"},
+				"erp":{"type":"oracle","host":"db","user":"u","password":"p","database":"d"}`,
+		},
+		{
+			name: "esb locked, erp not",
+			body: `"esb":{"host":"db","user":"u","password":"p","database":"d","forbid_cmd":true},
+				"erp":{"type":"oracle","host":"db","user":"u","password":"p","database":"d"}`,
+			esb: true,
+		},
+		{
+			name: "erp locked, esb not",
+			body: `"esb":{"host":"db","user":"u","password":"p","database":"d"},
+				"erp":{"type":"oracle","host":"db","user":"u","password":"p","database":"d","forbid_cmd":true}`,
+			erp: true,
+		},
+		{
+			name: "explicit false stays false",
+			body: `"esb":{"host":"db","user":"u","password":"p","database":"d","forbid_cmd":false},
+				"erp":{"type":"oracle","host":"db","user":"u","password":"p","database":"d","forbid_cmd":false}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadHelper(writeTempConfig(t, fmt.Sprintf(base, tc.body)))
+			if err != nil {
+				t.Fatalf("LoadHelper: %v", err)
+			}
+			if cfg.ESB.ForbidCmd != tc.esb {
+				t.Fatalf("esb ForbidCmd=%v, want %v", cfg.ESB.ForbidCmd, tc.esb)
+			}
+			if cfg.ERP.ForbidCmd != tc.erp {
+				t.Fatalf("erp ForbidCmd=%v, want %v", cfg.ERP.ForbidCmd, tc.erp)
 			}
 		})
 	}

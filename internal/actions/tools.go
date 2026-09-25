@@ -24,9 +24,20 @@ func (r *Registry) Tools() []Tool {
 	out := make([]Tool, 0, len(core)+len(r.dbops))
 	out = append(out, core...)
 	for _, def := range dbOpToolDefs {
-		if _, ok := r.dbops[def.Name]; ok {
-			out = append(out, def)
+		op, ok := r.dbops[def.Name]
+		if !ok || op == nil {
+			continue
 		}
+		// Connectors locked with config.json forbid_cmd announce the
+		// lock in the description so the calling agent knows not to
+		// attempt writes before its first rejected statement.
+		if ro, ok := op.(interface{ ReadOnly() bool }); ok && ro.ReadOnly() {
+			locked := def
+			locked.Description += " READ-ONLY: this connector is locked by config.json (forbid_cmd=true) — only SELECT / SHOW / DESC / EXPLAIN queries are accepted; every INSERT / UPDATE / DELETE / DDL / CALL statement is rejected before reaching the database."
+			out = append(out, locked)
+			continue
+		}
+		out = append(out, def)
 	}
 	return out
 }
@@ -69,13 +80,19 @@ func coreTools() []Tool {
 			InputSchema: restartSchema,
 		},
 		{
-			Name:        "deploy",
-			Description: "Full deploy cycle: stop_service → wait for catalina exit → replace_jar → start_service. Use this one-shot action instead of manually calling stop/replace/start. Returns per-step results (stop_result / replace_result / start_result), the final service state (final_state), and — if the start step fails — one state-aware fallback start attempt (start_fallback) so the service is never silently left stopped. Requires src and dest for the jar, plus optional stop_timeout/start_timeout.",
+			Name: "deploy",
+			Description: "Full deploy cycle: stop_service → wait for catalina exit → replace_jar → start_service. Use this one-shot action instead of manually calling stop/replace/start. Returns per-step results (stop_result / replace_result / start_result), the final service state (final_state), and — if the start step fails — one state-aware fallback start attempt (start_fallback) so the service is never silently left stopped. Requires src and dest for the jar, plus optional stop_timeout/start_timeout. " +
+				"The whole cycle routinely takes minutes and WILL outlive typical MCP tool timeouts: pass \"async\": true to get a task_id back immediately, then poll task_status until done=true. Even without async, every deploy is tracked under a task_id in the reply, so if this call times out at the transport level, call task_status (no task_id) to find it and see which step it reached.",
 			InputSchema: deploySchema,
 		},
 		{
+			Name:        "task_status",
+			Description: "Status of long-running helper tasks (currently deploys). With task_id: the full snapshot incl. per-step results and error. Without task_id: list of recent tasks so you can find one after a timed-out call. Deploy keeps running in the background even when the calling tool timed out — poll this instead of guessing from jar mtimes or sc query.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"task_id":{"type":"string","description":"Optional task id returned by deploy. Omit to list all tasks."}},"additionalProperties":false}`),
+		},
+		{
 			Name:        "wait_for_catalina",
-			Description: "Poll until catalina processes reach a target state: 'gone' (all catalina JVMs exited) or 'running' (at least one catalina JVM found). Returns whether the state was reached and if a timeout occurred.",
+			Description: "Poll until catalina processes reach a target state: 'gone' (all catalina JVMs exited) or 'running' (at least one catalina JVM found). Returns whether the state was reached and if a timeout occurred. When JVM process enumeration is unavailable on this box (sick WMI), state=gone is confirmed via `sc query` reporting STOPPED instead — see the note field in the reply.",
 			InputSchema: waitCatalinaSchema,
 		},
 		{
@@ -192,7 +209,8 @@ var deploySchema = json.RawMessage(`{
 		"dest":{"type":"string","description":"Destination jar path; must be under allowed_dirs."},
 		"restart":{"type":"boolean","description":"If true (default), also stop and start the service around the jar replacement."},
 		"stop_timeout":{"type":"integer","description":"Timeout in seconds for stop_service step. Default max(cfg.command_timeout, 60s) — a real catalina shutdown takes longer than the 30s command default.","minimum":1},
-		"start_timeout":{"type":"integer","description":"Timeout in seconds for start_service step (and for the fallback start on failure). Default max(cfg.command_timeout, 180s) — Tomcat boots slower than the command default.","minimum":1}
+		"start_timeout":{"type":"integer","description":"Timeout in seconds for start_service step (and for the fallback start on failure). Default max(cfg.command_timeout, 180s) — Tomcat boots slower than the command default.","minimum":1},
+		"async":{"type":"boolean","description":"Return a task_id immediately instead of blocking for the whole stop→replace→start cycle (minutes). Then poll task_status. Recommended — synchronous calls usually outlive the MCP tool timeout."}
 	},
 	"required":["src","dest"],
 	"additionalProperties":false

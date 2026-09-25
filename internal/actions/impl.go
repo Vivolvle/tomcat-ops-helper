@@ -33,7 +33,7 @@ type StatusData struct {
 	// empty (e.g. wmic and powershell both unavailable) instead of failing
 	// the whole action — the rest of the snapshot is still useful
 	// (2026-09-25 report: silent nulls are undebuggable).
-	JavaProbeError string `json:"java_probe_error,omitempty"`
+	JavaProbeError  string `json:"java_probe_error,omitempty"`
 	PortsProbeError string `json:"ports_probe_error,omitempty"`
 	// ConfigLoadedAt is when helper last read config.json. Compare against
 	// the file's mtime on disk: a mismatch means config.json was edited
@@ -184,6 +184,10 @@ type StopServiceData struct {
 	ServiceName string           `json:"service_name"`
 	Stop        execshell.Result `json:"stop"`
 	Exited      bool             `json:"exited"` // true if catalina processes confirmed gone
+	// ExitWait explains why Exited=false (wait timed out, or JVM
+	// enumeration unavailable and the service state could not confirm
+	// the exit). Informational only — the stop itself succeeded.
+	ExitWait string `json:"exit_wait,omitempty"`
 }
 
 func (r *Registry) stopService(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -211,13 +215,18 @@ func (r *Registry) stopService(ctx context.Context, params json.RawMessage) (jso
 	if v, ok := p["wait_timeout"].(float64); ok && v > 0 {
 		waitTimeout = time.Duration(v * float64(time.Second))
 	}
-	if err := r.waitForCatalinaExitWithTimeout(stopCtx, waitTimeout); err == nil {
+	if err := r.waitForCatalinaExitWithTimeout(stopCtx, waitTimeout, serviceName); err == nil {
 		data.Exited = true
-	} else if perr, ok := err.(*waitTimeoutError); ok && perr.timedOut {
-		// Not fatal - some catalina processes may linger
-		data.Exited = false
 	} else {
-		return nil, fmt.Errorf("stop_service: catalina exit wait failed: %w", err)
+		// Non-fatal: catalina may linger (timedOut) or JVM enumeration
+		// may be unavailable on this box (fell back to sc query). The
+		// stop itself succeeded — the caller decides whether to proceed.
+		data.Exited = false
+		if perr, ok := err.(*waitTimeoutError); ok {
+			data.ExitWait = perr.Error()
+		} else {
+			data.ExitWait = err.Error()
+		}
 	}
 	return mustMarshal(data), nil
 }
@@ -231,25 +240,40 @@ func (e *waitTimeoutError) Error() string {
 	return "catalina processes still running after timeout"
 }
 
-// waitForCatalinaExitWithTimeout waits for catalina processes to exit, returning a
-// waitTimeoutError if they don't exit in time (non-fatal).
-func (r *Registry) waitForCatalinaExitWithTimeout(ctx context.Context, timeout time.Duration) error {
+// waitForCatalinaExitWithTimeout waits for catalina processes to exit,
+// returning a waitTimeoutError if they don't exit in time (non-fatal).
+//
+// When JVM enumeration is unavailable (probe errors — 2026-09-25 report:
+// WIN-JRD8SLQTK01's WMI is sick and every strategy errored), we no longer
+// fail fast or wait blind: sc query takes over as the authority. A service
+// in STOPPED state means the SCM took the JVM down with it — good enough
+// to proceed. Only when BOTH signals are unavailable do we poll until the
+// deadline and return the (non-fatal) timeout.
+func (r *Registry) waitForCatalinaExitWithTimeout(ctx context.Context, timeout time.Duration, serviceName string) error {
 	pollCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
 		procs, err := r.probe.JavaProcesses(pollCtx)
 		if err != nil {
-			return err
-		}
-		found := false
-		for _, p := range procs {
-			if isInteresting(p, r.cfg.TomcatHome) {
-				found = true
-				break
+			// Probe unavailable: fall back to the service state. Empty
+			// serviceName (service discovery failed) keeps polling —
+			// bounded by the deadline below either way.
+			if serviceName != "" {
+				if state, serr := r.queryServiceState(pollCtx, serviceName); serr == nil && state == "STOPPED" {
+					return nil
+				}
 			}
-		}
-		if !found {
-			return nil
+		} else {
+			found := false
+			for _, p := range procs {
+				if isInteresting(p, r.cfg.TomcatHome) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil
+			}
 		}
 		select {
 		case <-pollCtx.Done():
@@ -264,6 +288,12 @@ type StartServiceData struct {
 	ServiceName string           `json:"service_name"`
 	Start       execshell.Result `json:"start"`
 	Running     bool             `json:"running"` // true if service confirmed RUNNING
+	// AlreadyRunning is set when sc start returned 1056 ("An instance of
+	// the service is already running") and a state re-check confirmed the
+	// service RUNNING — a racing start (e.g. a deploy task in the
+	// background, 2026-09-25 report) is success, not an error.
+	AlreadyRunning bool   `json:"already_running,omitempty"`
+	Note           string `json:"note,omitempty"`
 }
 
 func (r *Registry) startService(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -284,6 +314,28 @@ func (r *Registry) startService(ctx context.Context, params json.RawMessage) (js
 	defer startCancel()
 	data.Start, err = r.executor.Exec(startCtx, fmt.Sprintf("sc start %q", serviceName), r.cfg.TomcatHome)
 	if err != nil || data.Start.ExitCode != 0 {
+		// 1056 = ERROR_SERVICE_ALREADY_RUNNING: someone else (a deploy
+		// task, a slow SCM transition) started it first. Re-check the
+		// actual state instead of failing — already RUNNING means the
+		// caller's goal is achieved (2026-09-25 report).
+		if data.Start.ExitCode == 1056 || strings.Contains(strings.ToLower(data.Start.Stdout+data.Start.Stderr), "1056") {
+			state, serr := r.queryServiceState(startCtx, serviceName)
+			switch {
+			case serr == nil && state == "RUNNING":
+				data.Running = true
+				data.AlreadyRunning = true
+				data.Note = "sc start returned 1056 (already running); state re-check confirmed RUNNING"
+				return mustMarshal(data), nil
+			case serr == nil && (state == "START_PENDING" || state == "CONTINUE_PENDING"):
+				if werr := r.waitServiceState(startCtx, serviceName, "RUNNING"); werr == nil {
+					data.Running = true
+					data.AlreadyRunning = true
+					data.Note = "sc start returned 1056; service was START_PENDING and reached RUNNING"
+					return mustMarshal(data), nil
+				}
+			}
+			return nil, fmt.Errorf("start_service: sc start returned 1056 but service %s is not RUNNING (state=%s, err=%v)", serviceName, state, serr)
+		}
 		return nil, fmt.Errorf("start_service: service %s failed to start: %s", serviceName, resultMessage(data.Start, err))
 	}
 	if err := r.waitServiceState(startCtx, serviceName, "RUNNING"); err != nil {
@@ -300,6 +352,9 @@ type WaitCatalinaData struct {
 	Exited      bool   `json:"exited"`  // true if catalina processes gone
 	Running     bool   `json:"running"` // true if catalina processes found
 	TimedOut    bool   `json:"timed_out"`
+	// Note explains a fallback confirmation (e.g. "confirmed via sc
+	// query" when JVM enumeration is unavailable on this box).
+	Note string `json:"note,omitempty"`
 }
 
 func (r *Registry) waitCatalina(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -316,27 +371,47 @@ func (r *Registry) waitCatalina(ctx context.Context, params json.RawMessage) (js
 		state = "gone" // default
 	}
 	data := WaitCatalinaData{Wanted: state}
+	serviceName := r.discoverWindowsServiceName(ctx)
+	if serviceName != "" {
+		data.ServiceName = serviceName
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
 		procs, err := r.probe.JavaProcesses(waitCtx)
 		if err != nil {
-			return nil, fmt.Errorf("wait_for_catalina: probe: %w", err)
-		}
-		found := false
-		for _, pr := range procs {
-			if isInteresting(pr, r.cfg.TomcatHome) {
-				found = true
-				break
+			// JVM enumeration unavailable on this box (2026-09-25 report:
+			// WMI sick on WIN-JRD8SLQTK01). For state=gone the service
+			// state is an acceptable authority: sc query STOPPED ⇒ the
+			// SCM took the JVM down. For state=running we cannot confirm
+			// without enumeration — fall through to the deadline and
+			// report the probe failure instead of a blind wait.
+			if state == "gone" && serviceName != "" {
+				if s, serr := r.queryServiceState(waitCtx, serviceName); serr == nil && s == "STOPPED" {
+					data.Exited = true
+					data.Note = "confirmed via sc query (JVM enumeration unavailable: " + err.Error() + ")"
+					return mustMarshal(data), nil
+				}
 			}
-		}
-		if state == "gone" && !found {
-			data.Exited = true
-			return mustMarshal(data), nil
-		}
-		if state == "running" && found {
-			data.Running = true
-			return mustMarshal(data), nil
+			if state == "running" {
+				return nil, fmt.Errorf("wait_for_catalina: probe: %w", err)
+			}
+		} else {
+			found := false
+			for _, pr := range procs {
+				if isInteresting(pr, r.cfg.TomcatHome) {
+					found = true
+					break
+				}
+			}
+			if state == "gone" && !found {
+				data.Exited = true
+				return mustMarshal(data), nil
+			}
+			if state == "running" && found {
+				data.Running = true
+				return mustMarshal(data), nil
+			}
 		}
 		select {
 		case <-waitCtx.Done():
@@ -364,7 +439,10 @@ type DeployData struct {
 	FallbackError string            `json:"fallback_error,omitempty"`
 	FinalState    string            `json:"final_state,omitempty"`
 	Error         string            `json:"error,omitempty"`
-	Step          string            `json:"step"` // which step failed
+	Step          string            `json:"step"` // which step failed / is running
+	// TaskID ties this deploy to its task_status entry. Present on every
+	// reply since every deploy — synchronous or async — is tracked.
+	TaskID string `json:"task_id,omitempty"`
 }
 
 func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
@@ -392,16 +470,60 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 	if v, ok := p["start_timeout"].(float64); ok && v > 0 {
 		startTimeout = time.Duration(v * float64(time.Second))
 	}
-	data := DeployData{Step: "begin"}
+	async := false
+	if v, ok := p["async"].(bool); ok {
+		async = v
+	}
+
+	core := func(wctx context.Context, data *DeployData, notify func()) {
+		r.deployCore(wctx, data, notify, src, dst, restart, stopTimeout, startTimeout)
+	}
+	t := r.runDeployTask(ctx, core)
+	if async {
+		// Caller knows the cycle outlives its tool timeout: hand back a
+		// task handle right away instead of a doomed synchronous wait.
+		return mustMarshal(map[string]any{
+			"task_id": t.ID,
+			"tool":    "deploy",
+			"status":  "running",
+			"hint":    "poll task_status with this task_id for step-level progress (stop_service → replace_jar → start_service)",
+		}), nil
+	}
+	select {
+	case <-t.doneCh:
+		data, _, _ := t.snapshot()
+		return mustMarshal(data), nil
+	case <-ctx.Done():
+		// The caller's transport is going away mid-deploy. Hand back the
+		// running task id instead of a dead timeout — the worker keeps
+		// going and task_status tells the caller where it is.
+		partial, _, _ := t.snapshot()
+		return mustMarshal(map[string]any{
+			"task_id": t.ID,
+			"tool":    "deploy",
+			"status":  "still_running",
+			"step":    partial.Step,
+			"hint":    "caller context expired before deploy finished; poll task_status with this task_id",
+		}), nil
+	}
+}
+
+// deployCore is the synchronous stop→replace→start cycle. It mutates
+// data in place and calls notify after every step so the wrapping task
+// publishes fresh snapshots for task_status polling. It never returns an
+// error — step failures are recorded on data and the cycle stops there
+// (callers get the partial picture, matching the pre-task contract).
+func (r *Registry) deployCore(ctx context.Context, data *DeployData, notify func(), src, dst string, restart bool, stopTimeout, startTimeout time.Duration) {
 	serviceName := r.discoverWindowsServiceName(ctx)
 	if serviceName != "" {
 		data.ServiceName = serviceName
 	}
-	// finish stamps the final observed service state and marshals. Every
-	// exit path goes through it so the caller always learns where the
-	// service ended up (a plain defer would run after the return value —
-	// here mustMarshal(data) — is already evaluated).
-	finish := func() (json.RawMessage, error) {
+	notify()
+
+	// finish stamps the final observed service state. Every exit path
+	// goes through it so the caller always learns where the service
+	// ended up.
+	finish := func() {
 		if serviceName != "" {
 			stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
@@ -409,7 +531,7 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 				data.FinalState = state
 			}
 		}
-		return mustMarshal(data), nil
+		notify()
 	}
 
 	// Step 1: stop the service
@@ -419,30 +541,38 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 	if stopErr != nil {
 		data.Error = stopErr.Error()
 		data.Step = "stop_service"
-		return finish() // return partial result, not error
+		finish()
+		return
 	}
 	var stopData StopServiceData
 	if jsonErr := json.Unmarshal(stopRaw, &stopData); jsonErr == nil {
 		data.StopResult = &stopData
 	}
+	notify()
 
 	// Step 2: replace jar if src/dest provided
 	if restart && src != "" && dst != "" {
+		data.Step = "replace_jar"
+		notify()
 		replaceRaw, replaceErr := r.replaceJar(ctx, mustMarshal(map[string]any{"src": src, "dest": dst, "restart": false}))
 		if replaceErr != nil {
 			data.Error = replaceErr.Error()
 			data.Step = "replace_jar"
-			return finish()
+			finish()
+			return
 		}
 		var replaceData ReplaceJarData
 		if jsonErr := json.Unmarshal(replaceRaw, &replaceData); jsonErr == nil {
 			data.ReplaceResult = &replaceData
 		}
+		notify()
 	}
 
 	// Step 3: start the service
 	startCtx, startCancel := context.WithTimeout(ctx, startTimeout)
 	defer startCancel()
+	data.Step = "start_service"
+	notify()
 	startRaw, startErr := r.startService(startCtx, mustMarshal(map[string]any{"timeout": float64(startTimeout.Seconds())}))
 	if startErr != nil {
 		data.Error = startErr.Error()
@@ -460,14 +590,15 @@ func (r *Registry) deploy(ctx context.Context, params json.RawMessage) (json.Raw
 		if fbErr != "" {
 			data.FallbackError = fbErr
 		}
-		return finish()
+		finish()
+		return
 	}
 	var startData StartServiceData
 	if jsonErr := json.Unmarshal(startRaw, &startData); jsonErr == nil {
 		data.StartResult = &startData
 	}
 
-	return finish()
+	finish()
 }
 
 // fallbackStart makes one state-aware best-effort attempt to leave the
@@ -647,7 +778,7 @@ func (r *Registry) restartWindowsService(ctx context.Context, serviceName string
 	}
 
 	// Wait for catalina processes to actually exit after service stops
-	if err := r.waitForCatalinaExitWithTimeout(stopCtx, stopTimeout); err != nil {
+	if err := r.waitForCatalinaExitWithTimeout(stopCtx, stopTimeout, serviceName); err != nil {
 		// Non-fatal: catalina may linger but we can still try to start
 	}
 
@@ -679,12 +810,6 @@ func (r *Registry) waitServiceState(ctx context.Context, serviceName, wanted str
 		case <-time.After(time.Second):
 		}
 	}
-}
-
-// waitForCatalinaExit waits for all catalina-related Java processes to exit.
-// This addresses the issue where service stops but catalina processes remain running.
-func (r *Registry) waitForCatalinaExit(ctx context.Context) error {
-	return r.waitForCatalinaExitWithTimeout(ctx, 30*time.Second)
 }
 
 func resultMessage(res execshell.Result, err error) string {
@@ -1340,6 +1465,7 @@ type ValidateConnector struct {
 	Port          int    `json:"port,omitempty"`
 	Database      string `json:"database,omitempty"`
 	CurrentSchema string `json:"current_schema,omitempty"`
+	ReadOnly      bool   `json:"read_only,omitempty"` // forbid_cmd lock is active
 	LatencyMs     int64  `json:"latency_ms,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
 }
@@ -1366,6 +1492,7 @@ func (r *Registry) validateConfig(ctx context.Context) (json.RawMessage, error) 
 			Port:          st.Port,
 			Database:      st.Database,
 			CurrentSchema: st.CurrentSchema,
+			ReadOnly:      st.ReadOnly,
 			LatencyMs:     st.LatencyMs,
 			LastError:     st.LastError,
 		}

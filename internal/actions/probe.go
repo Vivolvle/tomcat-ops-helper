@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // OSProbe is the production Probe. It shells out to platform utilities and
@@ -27,7 +28,13 @@ func NewOSProbe() *OSProbe { return &OSProbe{} }
 // processes whose command line mentions tomcat_home or contains "tomcat".
 func (p *OSProbe) JavaProcesses(ctx context.Context) ([]JavaProcess, error) {
 	if runtime.GOOS == "windows" {
-		return p.javaProcessesWindows(ctx)
+		// Bound each enumeration attempt so a hung WMI/PowerShell call
+		// cannot eat the caller's whole wait budget (2026-09-25 report:
+		// wait_for_catalina never returned on boxes with a sick WMI
+		// repository). The fallback chain below is tried within this cap.
+		pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		return p.javaProcessesWindows(pctx)
 	}
 	return p.javaProcessesUnix(ctx)
 }
@@ -40,42 +47,108 @@ func (p *OSProbe) javaProcessesWindows(ctx context.Context) ([]JavaProcess, erro
 	// java.exe process ever exists and status/wait_for_catalina saw a
 	// permanent empty list (2026-09-25 report).
 	//
-	// wmic was deprecated in newer Windows builds and is often absent from
-	// PATH. Fall back to PowerShell so we keep working on current OS images.
+	// Strategy chain, most to least informative: wmic → PowerShell
+	// Get-CimInstance → tasklist. A strategy that errors OR returns zero
+	// rows (a real Windows box always has dozens of processes — zero
+	// rows means the tool is a broken stub, e.g. wmic on Win11 24H2)
+	// falls through to the next. tasklist has no WMI dependency at all
+	// and still names the prunsrv-hosted JVM binary, which is enough for
+	// isInteresting (2026-09-25 report: both WMI paths failed on
+	// WIN-JRD8SLQTK01, leaving status.java_processes null and
+	// wait_for_catalina blind).
 	if _, err := exec.LookPath("wmic"); err == nil {
 		cmd := exec.CommandContext(ctx, "wmic", "process", "get", "ProcessId,Name,CommandLine", "/format:list")
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		if err := cmd.Run(); err == nil {
-			return filterInterestingProcesses(parseWmicList(out.String())), nil
+			procs := parseWmicList(out.String())
+			if len(procs) > 0 {
+				return filterInterestingProcesses(procs), nil
+			}
 		}
 	}
-	psCmd := `Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Csv -NoTypeInformation`
-	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", psCmd)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("powershell: %w", err)
+	{
+		psCmd := `Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Csv -NoTypeInformation`
+		cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", psCmd)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err == nil {
+			procs := parsePowerShellCSV(out.String())
+			if len(procs) > 0 {
+				return filterInterestingProcesses(procs), nil
+			}
+		}
 	}
-	return filterInterestingProcesses(parsePowerShellCSV(out.String())), nil
+	{
+		cmd := exec.CommandContext(ctx, "tasklist", "/FO", "CSV", "/NH")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("tasklist: %w", err)
+		}
+		return filterInterestingProcesses(parseTasklistCSV(out.String())), nil
+	}
+}
+
+// parseTasklistCSV parses `tasklist /FO CSV /NH` output:
+// "tomcat10-esb.exe","1234","Console","1","51,240 K". Only the first
+// two fields matter; CommandLine is unavailable via tasklist and left
+// empty — isInteresting falls back to the image name.
+func parseTasklistCSV(s string) []JavaProcess {
+	var procs []JavaProcess
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := splitCSV(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.Trim(strings.TrimSpace(fields[1]), "\""))
+		if err != nil {
+			continue
+		}
+		procs = append(procs, JavaProcess{
+			PID:  pid,
+			Name: strings.Trim(strings.TrimSpace(fields[0]), "\""),
+		})
+	}
+	return procs
 }
 
 // looksLikeJVM reports whether an enumerated Windows process could be
 // hosting the Tomcat JVM: a java executable, or — for Tomcat registered as
 // a Windows service via procrun with StartMode=jvm — the renamed prunsrv
-// binary whose image name or command line references tomcat/catalina
-// (e.g. "D:\...\tomcat10-esb.exe" //RS//tomcat10-esb). The caller still
-// applies isInteresting on top of this for status/kill filtering.
+// binary whose image name references tomcat/catalina (e.g.
+// "D:\...\tomcat10-esb.exe" //RS//tomcat10-esb). The caller still applies
+// isInteresting on top of this for status/kill filtering.
+//
+// Two deliberate NON-matches (2026-09-25 report: waits hung for minutes
+// on processes that merely looked Tomcat-ish):
+//
+//   - the procrun monitor GUI (prunmgr renamed <Service>w.exe, e.g.
+//     tomcat10-esbw.exe) — it runs whether the service is up or not;
+//   - non-Java processes whose COMMAND LINE merely mentions
+//     tomcat/catalina — e.g. an operator's `Get-Content catalina.log`
+//     or an editor with the file open. The cmdline match is only
+//     trusted for java-named executables; everything else must match
+//     on image name.
 func looksLikeJVM(p JavaProcess) bool {
 	name := strings.ToLower(p.Name)
 	if strings.HasPrefix(name, "java") { // java.exe, javaw.exe
 		return true
 	}
 	if strings.Contains(name, "tomcat") || strings.Contains(name, "catalina") {
-		return true
+		return !strings.HasSuffix(name, "w.exe") // prunmgr monitor is not the JVM
 	}
-	lc := strings.ToLower(p.Cmdline)
-	return strings.Contains(lc, "tomcat") || strings.Contains(lc, "catalina")
+	if name == "" {
+		// Some enumerators (wmic list format without Name) return only
+		// CommandLine; keep the old behaviour for those.
+		lc := strings.ToLower(p.Cmdline)
+		return strings.Contains(lc, "tomcat") || strings.Contains(lc, "catalina")
+	}
+	return false
 }
 
 func filterInterestingProcesses(procs []JavaProcess) []JavaProcess {

@@ -23,6 +23,12 @@ type FakeOp struct {
 	// Open toggles Status.Open. Defaults to true.
 	Open bool
 
+	// ForbidCmd makes the fake advertise itself read-only (ReadOnly()
+	// and Status.ReadOnly), mirroring SQLOp's forbid_cmd lock. The fake
+	// does NOT enforce the policy — that lives in SQLOp; this only
+	// feeds the tool-description builder.
+	ForbidCmd bool
+
 	// LastError is surfaced by Status when Open is false.
 	LastError string
 
@@ -47,6 +53,10 @@ type FakeCall struct {
 	SQL  string
 }
 
+// ReadOnly satisfies the same optional accessor SQLOp exposes; see
+// SQLOp.ReadOnly.
+func (f *FakeOp) ReadOnly() bool { return f.ForbidCmd }
+
 // Status satisfies Op.
 func (f *FakeOp) Status(ctx context.Context) Status {
 	f.mu.Lock()
@@ -58,6 +68,7 @@ func (f *FakeOp) Status(ctx context.Context) Status {
 		Host:          f.Host,
 		Database:      f.Database,
 		CurrentSchema: f.CurrentSchema,
+		ReadOnly:      f.ForbidCmd,
 	}
 	if f.LastError != "" {
 		st.LastError = f.LastError

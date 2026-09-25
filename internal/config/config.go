@@ -69,6 +69,12 @@ type DBConfig struct {
 	// from an explicit false. JSON omitempty drops it when nil so the
 	// field never appears in output unless the operator set it.
 	Enabled *bool `json:"enabled,omitempty"`
+	// ForbidCmd locks the connector to read-only when an operator sets
+	// it to true in the config.json on the customer box: only SELECT /
+	// SHOW / DESC / EXPLAIN queries are served; INSERT / UPDATE / DELETE
+	// / DDL / CALL are rejected before reaching the database. Default
+	// false — omit the field entirely when the connector may write.
+	ForbidCmd bool `json:"forbid_cmd,omitempty"`
 }
 
 // IsEnabled reports whether the corresponding dbop tool should be

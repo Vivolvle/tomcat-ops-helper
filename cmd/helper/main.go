@@ -230,12 +230,16 @@ func fatal(err error) {
 // surface the failure on the first call (with a fresh retry attempt).
 func wireDB(ctx context.Context, logger *log.Logger, reg *actions.Registry, toolName string, cfg *config.DBConfig) {
 	driver := cfg.Driver()
+	roTag := ""
+	if cfg.ForbidCmd {
+		roTag = ", read-only"
+	}
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	op, err := dbop.NewSQLOp(pingCtx, cfg)
 	if err != nil {
-		logger.Printf("warn: %s (%s@%s:%d/%s): startup ping failed: %v — tool will retry on first use",
-			toolName, cfg.User, cfg.Host, cfg.EffectivePort(driver), cfg.Database, err)
+		logger.Printf("warn: %s (%s@%s:%d/%s%s): startup ping failed: %v — tool will retry on first use",
+			toolName, cfg.User, cfg.Host, cfg.EffectivePort(driver), cfg.Database, roTag, err)
 		// Still register the Op: it has the retry-once machinery and
 		// will reconnect lazily when the operator actually uses the
 		// tool. Otherwise the operator gets a confusing "not
@@ -245,7 +249,7 @@ func wireDB(ctx context.Context, logger *log.Logger, reg *actions.Registry, tool
 		}
 		return
 	}
-	logger.Printf("info: %s connected (%s@%s:%d/%s)",
-		toolName, cfg.User, cfg.Host, cfg.EffectivePort(driver), cfg.Database)
+	logger.Printf("info: %s connected (%s@%s:%d/%s%s)",
+		toolName, cfg.User, cfg.Host, cfg.EffectivePort(driver), cfg.Database, roTag)
 	reg.WithDB(toolName, op)
 }

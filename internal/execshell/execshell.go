@@ -278,7 +278,14 @@ func (e *Executor) Exec(ctx context.Context, cmd, workDir string) (Result, error
 		return Result{}, err
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, e.cfg.CommandTimeout)
+	// cfg.CommandTimeout is the DEFAULT budget, not a ceiling. The
+	// per-command "timeout" param is applied by the caller as a ctx
+	// deadline; WithTimeout(parent, X) yields min(parent, X), so
+	// unconditionally wrapping here collapsed any explicit timeout
+	// above CommandTimeout (30s default) back down to 30s — 2026-09-25
+	// report: Start-Sleep 40–90s with timeout 60–110s all died at ~30s.
+	// Only inject the default when the caller set no deadline of its own.
+	timeoutCtx, cancel := contextDeadlineOr(ctx, e.cfg.CommandTimeout)
 	defer cancel()
 
 	name, args := splitCommand(cmd)
@@ -289,7 +296,7 @@ func (e *Executor) Exec(ctx context.Context, cmd, workDir string) (Result, error
 		// Runner returned a timeout / context error; surface a sentinel.
 		if errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
 			e.audit(cmd, workDir, Result{ExitCode: -1, Took: took}, took, "timeout")
-			return Result{Took: took}, fmt.Errorf("exec timeout after %s", e.cfg.CommandTimeout)
+			return Result{Took: took}, fmt.Errorf("exec timeout after %s", took.Round(time.Millisecond))
 		}
 		e.audit(cmd, workDir, raw, took, err.Error())
 		return raw, err
@@ -327,6 +334,18 @@ func truncateMiddle(s string, head, tail, original int) string {
 	}
 	marker := fmt.Sprintf("\n...[truncated %d bytes]...\n", original-head-tail)
 	return s[:head] + marker + s[len(s)-tail:]
+}
+
+// contextDeadlineOr returns ctx unchanged when it already carries a
+// deadline; otherwise it derives a ctx with the given default timeout.
+// WithTimeout(parent, X) computes min(parent, X), so a default injected
+// on top of a caller-set deadline could only ever SHRINK it — never
+// extend it — which is why the "has deadline" case must pass through.
+func contextDeadlineOr(ctx context.Context, def time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, def)
 }
 
 // splitCommand picks the platform-correct shell and tokenises cmd. We avoid

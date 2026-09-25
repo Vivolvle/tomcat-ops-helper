@@ -163,6 +163,47 @@ function instead of writing to disk.
 - Oracle PL/SQL blocks are accepted as one statement even with internal
   semicolons. A SQL*Plus `/` on its own line terminates the block and is
   stripped before execution; it is not Oracle SQL and must not reach go-ora.
+- **Read-only lock (`forbid_cmd`)**: setting `"forbid_cmd": true` inside the
+  `esb` or `erp` config.json block locks that connector to read-only —
+  `SQLOp.Exec` refuses everything, and Query additionally enforces a narrow
+  allowlist (`SELECT` / `SHOW` / `DESC` / `DESCRIBE` / `EXPLAIN SELECT` /
+  `EXPLAIN ANALYZE SELECT`), so `WITH … DELETE`-style statements that the
+  router would normally treat as queries are rejected too, as are
+  `EXPLAIN DELETE` and `SELECT … INTO OUTFILE`. Default false; an absent key
+  changes nothing. Meant to be flipped by hand on the customer box to protect
+  production data; takes effect after a helper restart. A locked connector
+  announces itself in the tool description ("READ-ONLY: …"), in the startup
+  log (`… connected (user@host:port/db, read-only)`), in
+  `validate_config` (`connectors.<name>.read_only`), and in every tool
+  response (`read_only: true`). Policy rejections do not count as connector
+  failures (`status.last_error` stays clean).
+- **Exec deadlines (2026-09-25 fix)**: `exec` applies `cfg.command_timeout`
+  only when the caller context carries **no** deadline. `context.WithTimeout`
+  takes min(parent, d), so the old unconditional wrap silently capped
+  stop/start waits at the 30s command default even when the caller asked for
+  more. Named actions that pass their own deadline (stop_service, deploy, …)
+  now get exactly what they ask for.
+- **JVM enumeration on sick-WMI boxes**: `probe.JavaProcesses` tries wmic →
+  PowerShell `Get-CimInstance` → `tasklist /FO CSV /NH` (name+PID only, no
+  cmdline), each with a 15s bound, falling through on zero rows. A total
+  failure no longer blanks `status` — it surfaces as
+  `java_probe_error`. Waits treat `sc query` STOPPED as authoritative
+  confirmation that the JVM is down (`stop_service`, `wait_for_catalina`
+  note the fallback), and `looksLikeJVM` ignores the always-running procrun
+  monitor (`<Service>w.exe`) plus non-Java processes whose *cmdline* merely
+  mentions catalina (an operator reading logs is not the JVM).
+- **start_service is idempotent**: `sc start` returning 1056 ("already
+  running") re-checks the service state; RUNNING or START_PENDING→RUNNING is
+  reported as success with `already_running: true` instead of an error.
+- **deploy runs as a tracked task**: every deploy registers a
+  `task_id` (reply carries it, sync or async). With `"async": true` the call
+  returns a running handle immediately — poll `task_status` (with the id, or
+  omit it to list recent tasks) for step-level progress
+  (stop_service → replace_jar → start_service) and the final state. The
+  background worker runs detached from the caller's transport on a 30-minute
+  budget, so an MCP-timeout mid-cycle no longer aborts the box in a
+  stopped state; recover by polling `task_status` with the task_id from the
+  (timed-out) call's listing.
 - Default helper.exe is built **with console** for visibility. For stealth,
   rebuild with `-ldflags="-H windowsgui -s -w"`. `run-helper.ps1` has the note.
 
@@ -468,7 +509,8 @@ ghost bugs.
    `D:\bs-esb\helper-client\run-helper.ps1`.
 5. **Verify startup log** — should see
    `info: esb_db_operator connected (...)` and
-   `info: erp_db_operator connected (...)`. If either says
+   `info: erp_db_operator connected (...)` — a `, read-only)` suffix means
+   `forbid_cmd` is active on that connector. If either says
    `startup ping failed: ...`, the config.json password is wrong;
    fix and go back to step 4.
 6. **Optional: run `validate_config`** — once it shows up in MCP

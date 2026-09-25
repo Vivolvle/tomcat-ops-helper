@@ -59,6 +59,27 @@ func TestTools_IncludesWiredDBOps(t *testing.T) {
 	}
 }
 
+// TestTools_ReadOnlyDescription ensures a connector locked with
+// forbid_cmd announces the lock in its advertised description, so the
+// calling agent sees the constraint before its first rejected write.
+func TestTools_ReadOnlyDescription(t *testing.T) {
+	cfg := mustCfg(t)
+	reg := NewRegistry(cfg, mustExec(t)).
+		WithDB("esb_db_operator", &dbop.FakeOp{Driver: "mysql", Database: "esb", ForbidCmd: true}).
+		WithDB("erp_db_operator", &dbop.FakeOp{Driver: "oracle", Database: "ORCL"})
+
+	desc := map[string]string{}
+	for _, tool := range reg.Tools() {
+		desc[tool.Name] = tool.Description
+	}
+	if !strings.Contains(desc["esb_db_operator"], "READ-ONLY") {
+		t.Fatalf("locked esb_db_operator description should carry the READ-ONLY clause: %q", desc["esb_db_operator"])
+	}
+	if strings.Contains(desc["erp_db_operator"], "READ-ONLY") {
+		t.Fatalf("unlocked erp_db_operator description must not claim READ-ONLY: %q", desc["erp_db_operator"])
+	}
+}
+
 // TestDispatch_DBOpNotWired ensures dispatching a dbop tool without
 // a connector returns a clear error rather than panicking or
 // silently succeeding.
@@ -135,7 +156,7 @@ func TestDispatch_DBOpRunsScript(t *testing.T) {
 func TestDispatch_DBOpClampsMaxRows(t *testing.T) {
 	gotMax := 0
 	fake := &dbop.FakeOp{
-		Driver:     "mysql",
+		Driver: "mysql",
 		QueryHandler: func(_ context.Context, _ string, maxRows int) (dbop.QueryResult, error) {
 			gotMax = maxRows
 			return dbop.QueryResult{}, nil
@@ -162,7 +183,7 @@ func TestDispatch_DBOpClampsMaxRows(t *testing.T) {
 // confusing failure mode.
 func TestDispatch_DBOpTimeoutClampsBelowPerStmt(t *testing.T) {
 	fake := &dbop.FakeOp{
-		Driver:     "mysql",
+		Driver: "mysql",
 		QueryHandler: func(_ context.Context, _ string, _ int) (dbop.QueryResult, error) {
 			return dbop.QueryResult{}, nil
 		},
@@ -174,9 +195,9 @@ func TestDispatch_DBOpTimeoutClampsBelowPerStmt(t *testing.T) {
 	// per-stmt timeout (1s) and a smaller total (0.5s) — the action
 	// should bump total up to per-stmt, not refuse the call.
 	_, err := reg.Dispatch(context.Background(), "esb_db_operator", mustMarshal(map[string]any{
-		"sql":              "SELECT 1",
+		"sql":               "SELECT 1",
 		"statement_timeout": 1,
-		"timeout":          1, // equal — fine
+		"timeout":           1, // equal — fine
 	}))
 	if err != nil {
 		t.Fatalf("dispatch: %v", err)

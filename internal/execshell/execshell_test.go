@@ -456,3 +456,64 @@ func TestOSRunner_LongCommandDoesNotBlockAnotherExec(t *testing.T) {
 		t.Fatal("long command did not stop after cancellation")
 	}
 }
+
+// deadlineCaptureRunner records the deadline of the context Executor hands
+// down to the runner, so tests can assert which deadline actually applied.
+type deadlineCaptureRunner struct {
+	deadline time.Time
+	hasDDL   bool
+}
+
+func (d *deadlineCaptureRunner) Run(ctx context.Context, _ string, _ []string, _ string) (Result, error) {
+	d.deadline, d.hasDDL = ctx.Deadline()
+	return Result{ExitCode: 0, Stdout: "ok"}, nil
+}
+
+// TestExec_CallerDeadlineNotCappedByCommandTimeout pins the 2026-09-25
+// problem.md fix: context.WithTimeout takes min(parent, d), so wrapping a
+// caller context that already carries a longer deadline in
+// cfg.CommandTimeout silently capped service-stop/start waits at the 30s
+// command default mid-deploy. Exec must leave an existing deadline alone
+// and only apply CommandTimeout as the default when none is set.
+func TestExec_CallerDeadlineNotCappedByCommandTimeout(t *testing.T) {
+	cfg := mustConfig(t) // CommandTimeout = 2s
+	runner := &deadlineCaptureRunner{}
+	exec := NewExecutor(cfg).WithRunner(runner)
+
+	// Caller deadline LONGER than CommandTimeout: must survive (being cut
+	// to 2s here was the bug).
+	longCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := exec.Exec(longCtx, "echo hi", cfg.AllowedDirs[0]); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if !runner.hasDDL {
+		t.Fatal("runner ctx should carry a deadline")
+	}
+	if remaining := time.Until(runner.deadline); remaining < 25*time.Second {
+		t.Fatalf("caller deadline was capped: remaining=%s, want >25s (CommandTimeout=%s)", remaining, cfg.CommandTimeout)
+	}
+
+	// No caller deadline: cfg.CommandTimeout applies as the default.
+	runner.hasDDL = false
+	if _, err := exec.Exec(context.Background(), "echo hi", cfg.AllowedDirs[0]); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if !runner.hasDDL {
+		t.Fatal("runner ctx should carry the CommandTimeout deadline")
+	}
+	if remaining := time.Until(runner.deadline); remaining <= 0 || remaining > cfg.CommandTimeout {
+		t.Fatalf("expected ~%s default deadline, remaining=%s", cfg.CommandTimeout, remaining)
+	}
+
+	// Caller deadline SHORTER than CommandTimeout: still honored (min semantics).
+	runner.hasDDL = false
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer shortCancel()
+	if _, err := exec.Exec(shortCtx, "echo hi", cfg.AllowedDirs[0]); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if remaining := time.Until(runner.deadline); remaining > 500*time.Millisecond {
+		t.Fatalf("short caller deadline should win, remaining=%s", remaining)
+	}
+}
