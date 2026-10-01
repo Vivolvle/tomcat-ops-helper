@@ -40,7 +40,7 @@ desktop.ini
 # Opencode local state
 .opencode/
 
-# Local staging output (out/helper-client, out/helper-server) — carries
-# real-token config.json and 14 MB exes; distribution stays in the
-# dedicated gitee staging repos, never in this repo's history.
+# Local staging output (out/helper-client, out/helper-server) — the sole
+# deploy staging entry point. Carries real-token config.json and 14 MB
+# exes; must never land in this repo's history.
 out/

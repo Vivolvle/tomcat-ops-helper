@@ -81,14 +81,16 @@ go run ./cmd/gencert                   # one-time self-signed certs into certs/
 Whenever helper source changes (new tool, bug fix), go through this checklist end-to-end. Skipping steps leads to "I edited config.json but the new password doesn't work" ghost bugs.
 
 1. **Local build + test** — `go test -count=1 -timeout 60s ./...`, then `go build -ldflags="-s -w" -o bin/helper.exe ./cmd/helper`.
-2. **Sync operator staging dir (REQUIRED)** — the staging folder must always track the latest binary; a stale copy there has caused real "wrong binary on the customer box" bugs:
+2. **Sync operator staging dir (REQUIRED)** — `out/helper-client/` is the **only** staging entry point (the old `D:\tools\helper-client` + gitee mirror are retired). It must always track the latest binary; a stale copy there has caused real "wrong binary on the customer box" bugs:
 
    ```powershell
-   Copy-Item -Force .\bin\helper.exe D:\tools\helper-client\helper.exe
+   Copy-Item -Force .\bin\helper.exe .\out\helper-client\helper.exe
    $a = (Get-FileHash .\bin\helper.exe).Hash
-   $b = (Get-FileHash 'D:\tools\helper-client\helper.exe').Hash
+   $b = (Get-FileHash '.\out\helper-client\helper.exe').Hash
    if ($a -ne $b) { throw "staging helper.exe sha256 mismatch: $a vs $b" }
    ```
+
+   `out/` is gitignored on purpose — it carries the real-token config.json and the 14 MB exe; never commit it. When a config field changes for a deployment, edit `out/helper-client/config.json` there too (and after rollout, confirm with `validate_config` / `reload_config`).
 
 3. **Hand off to customer box** — copy to `D:\bs-esb\helper-client\helper.exe` on the helper host. Same sha256 expected.
 4. **Restart helper** — kill the running `helper.exe` (taskkill /F /IM helper.exe, or close the run-helper.ps1 console), then start `D:\bs-esb\helper-client\run-helper.ps1`.
@@ -115,7 +117,7 @@ If curl returns `bad request` / `action is required`, `bin\server.exe` is stale 
 
 ## `legacy-win2012` branch (frozen)
 
-One customer box (比硕) runs Windows Server 2012 R2, whose loader rejects Go 1.21+ binaries (ERROR_BAD_EXE_FORMAT). That branch builds helper with Go 1.20.14 by full path (`D:/Scoop/apps/go120/current/bin/go.exe build -ldflags="-s -w" -o bin/helper-2012r2.exe ./cmd/helper`), pins old deps in go.mod, and stages to `D:\tools\helper-client-2012r2\` as `helper-2012r2.exe`. **Not routinely maintained** — every other box runs master builds (`D:\tools\helper-client`). Merge from master only if that box needs a new feature (loop-var semantics revert to pre-1.22 there; re-audit if you add loops that spawn goroutines). Never cross-copy exes between the two staging folders.
+One customer box (比硕) runs Windows Server 2012 R2, whose loader rejects Go 1.21+ binaries (ERROR_BAD_EXE_FORMAT). That branch builds helper with Go 1.20.14 by full path (`D:/Scoop/apps/go120/current/bin/go.exe build -ldflags="-s -w" -o bin/helper-2012r2.exe ./cmd/helper`), pins old deps in go.mod, and stages to `D:\tools\helper-client-2012r2\` as `helper-2012r2.exe`. **Not routinely maintained** — every other box runs master builds (staged in `out/helper-client/`). Merge from master only if that box needs a new feature (loop-var semantics revert to pre-1.22 there; re-audit if you add loops that spawn goroutines). Never cross-copy exes between the two staging folders.
 
 ## Common traps
 
