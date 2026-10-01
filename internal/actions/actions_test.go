@@ -206,6 +206,41 @@ func TestListLogs_OK(t *testing.T) {
 	}
 }
 
+// TestListLogs_IncludesDirs (todo H2): subdirectory entries must appear
+// with type dir so callers can descend without another tool.
+func TestListLogs_IncludesDirs(t *testing.T) {
+	cfg := mustCfg(t)
+	if err := os.Mkdir(filepath.Join(cfg.LogDir, "subdir"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	reg := NewRegistry(cfg, mustExec(t))
+	raw, err := reg.listLogs(nil)
+	if err != nil {
+		t.Fatalf("listLogs: %v", err)
+	}
+	var got struct {
+		Files []LogFile `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var dirEntry, fileTypesOK = false, true
+	for _, f := range got.Files {
+		switch {
+		case f.Name == "subdir":
+			dirEntry = f.Type == "dir"
+		case f.Type != "file":
+			fileTypesOK = false
+		}
+	}
+	if !dirEntry {
+		t.Fatalf("subdir must be listed with type dir, got %+v", got.Files)
+	}
+	if !fileTypesOK {
+		t.Fatalf("non-dir entries must carry type file, got %+v", got.Files)
+	}
+}
+
 func TestTail_OK(t *testing.T) {
 	cfg := mustCfg(t)
 	path := filepath.Join(cfg.LogDir, "sample.log")

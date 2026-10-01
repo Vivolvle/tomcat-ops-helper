@@ -56,7 +56,7 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "list_logs",
-			Description: "List files in log_dir (or a directory under allowed_dirs) with name, size and modification time, newest first.",
+			Description: "List entries in log_dir (or a directory under allowed_dirs) with name, type (file|dir), size and modification time, newest first. Subdirectories are included with type dir — use them to descend into nested directories.",
 			InputSchema: listLogsSchema,
 		},
 		{
@@ -132,7 +132,12 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "validate_config",
-			Description: "Return what helper actually loaded: tomcat_home / jdk_home / log_dir existence, every allowed_dirs entry with existence check, and a per-connector health snapshot (Open / Driver / Host / Port / Database / LatencyMs / LastError). Connectors that were never wired in (esb / erp blocks missing from config.json) are omitted. Passwords are never returned. Use after editing config.json and restarting helper to confirm changes took effect.",
+			Description: "Return what helper actually loaded: tomcat_home / jdk_home / log_dir existence, every allowed_dirs entry with existence check, and a per-connector health snapshot (Open / Driver / Host / Port / Database / LatencyMs / LastError). Connectors that were never wired in (esb / erp blocks missing from config.json) are omitted. Passwords are never returned. Use after editing config.json (and reload_config or a helper restart) to confirm changes took effect.",
+			InputSchema: emptyObjectSchema,
+		},
+		{
+			Name:        "reload_config",
+			Description: "Re-read config.json from disk, validate it, and hot-swap it into the running helper WITHOUT a restart: allowed_dirs / tomcat_home / jdk_home / log_dir / db blocks (esb, erp) take effect immediately, DB connectors are closed and re-wired, and the MCP tool list is re-pushed to the server. On any parse/validate error the reload aborts and the running config is left unchanged. Workflow: write_file the new config.json, then call this, then validate_config. LIMITS: server_url / token / heartbeat changes are NOT applied (captured at startup — still needs a restart); a DB query in flight during the connector rebuild may error, just re-issue it.",
 			InputSchema: emptyObjectSchema,
 		},
 		{

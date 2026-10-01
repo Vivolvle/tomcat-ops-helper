@@ -104,9 +104,12 @@ func isInteresting(p JavaProcess, tomcatHome string) bool {
 	return false
 }
 
-// LogFile describes one entry returned by list_logs.
+// LogFile describes one entry returned by list_logs. Subdirectories are
+// included too (todo H2): Type distinguishes "dir" from "file" so callers
+// can descend without a separate listing tool.
 type LogFile struct {
 	Name    string    `json:"name"`
+	Type    string    `json:"type"` // "file" | "dir"
 	Size    int64     `json:"size"`
 	ModTime time.Time `json:"mod_time"`
 }
@@ -129,14 +132,15 @@ func (r *Registry) listLogs(params json.RawMessage) (json.RawMessage, error) {
 	}
 	files := make([]LogFile, 0, len(entries))
 	for _, e := range entries {
+		kind := "file"
 		if e.IsDir() {
-			continue
+			kind = "dir"
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		files = append(files, LogFile{Name: e.Name(), Size: info.Size(), ModTime: info.ModTime().UTC()})
+		files = append(files, LogFile{Name: e.Name(), Type: kind, Size: info.Size(), ModTime: info.ModTime().UTC()})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].ModTime.After(files[j].ModTime) })
 	return mustMarshal(map[string]any{"dir": dir, "files": files}), nil
