@@ -18,7 +18,6 @@ cmd/server/    operator-side wss relay + HTTP bridge
 cmd/server/server_tools.go   server-local MCP tools (report_problem)
 cmd/mcpstdio/  MCP-over-stdio bridge → server.exe /mcp/* (for MCP Inspector / opencode)
 cmd/gencert/   one-shot self-signed cert generator for local testing
-todo.md        live list of MCP capability gaps surfaced during testing
 problem.md     usage-friction log written by the server-local report_problem tool
 internal/protocol/   Envelope / Hello / ToolList / Command / Result JSON types
 internal/config/     config.json load + Validate
@@ -55,20 +54,13 @@ Inspector, opencode, or any other MCP client), follow these rules:
   `AGENTS.md`, etc.) uses opencode's built-in tools as usual.
 - **If a task can't be done via MCP** (tool missing, blocked by
   `allowed_dirs`, helper offline, ...), do **not** silently fall back to
-  bash. Instead append a line to `todo.md`:
-
-  ```
-  - [YYYY-MM-DD] <what's missing> — <expected tool name or root cause>
-  ```
-
-  Tell the user briefly that it was logged, then keep doing whatever else is
-  possible. `todo.md` is a temporary capability-gap log; collapse it into the
-  real requirements once testing settles.
+  bash. Tell the user briefly what was blocked, log it via
+  `report_problem` (below), then keep doing whatever else is possible.
 - **Feedback goes through `report_problem`.** If a tool is missing, awkward,
   or misbehaving, call the server-local `report_problem` tool (works even when
   no helper is connected) instead of only mentioning it in chat or silently
-  working around it. Entries are appended to `problem.md` (same directory as
-  `todo.md`), which the operator reviews periodically.
+  working around it. Entries are appended to `problem.md` (repo root, same
+  directory as this file), which the operator reviews periodically.
 - **Clear resolved problems.** After every item in `problem.md` has been
   implemented and verified, remove the completed entries from `problem.md` so
   it contains only pending work. Always preserve the explanatory header and
@@ -318,7 +310,8 @@ action — it's atomic, no-BOM, no cmd.exe pain:
 - Atomic via `<path>.tmp` + fsync + rename.
 - Returns `{path, bytes, sha256, overwritten}` so the caller can verify.
 - For files larger than a few hundred KB, use `exec` + `EncodedCommand`
-  (recipes below) or wait for `upload_file` (planned, see todo.md).
+  (recipes below) or the server's chunked `POST /upload` (see the
+  `upload_guide` helper tool for the exact curl procedure).
 
 ### When you must use `exec` for writes
 
@@ -519,9 +512,15 @@ ghost bugs.
    whether a config change took effect.
 
 `config.json` changes (`tomcat_home`, `jdk_home`, `log_dir`,
-`allowed_dirs`, `esb.*`, `erp.*`) require **steps 4–6** but not
-1–3 — helper reads config.json at startup. There is no SIGHUP /
-file-watch / hot-reload; a restart is the only way.
+`allowed_dirs`, `esb.*`, `erp.*`) no longer need a restart: edit the
+file (via `write_file`), then call the helper's `reload_config` tool —
+it re-reads + validates config.json, hot-swaps the running config,
+closes and re-wires the DB connectors, and re-pushes the MCP tool list
+to the server. A parse/validate error aborts the reload and keeps the
+running config. **Exception:** `server_url` / `token` / heartbeat
+intervals are captured at process start — changing those still requires
+steps 4–6 (restart). Follow up with `validate_config` to confirm the
+connectors reconnected.
 
 ## Common traps
 
