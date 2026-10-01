@@ -72,7 +72,7 @@ func main() {
 	}
 
 	exec := execshell.NewExecutor(cfg).WithAuditor(audit)
-	registry := actions.NewRegistry(cfg, exec)
+	registry := actions.NewRegistry(cfg, exec).WithConfigPath(abs)
 
 	hostname, _ := os.Hostname()
 
@@ -147,20 +147,7 @@ func main() {
 				SentAt:   time.Now().UnixMilli(),
 			}
 		},
-		PostConnect: func(conn interface {
-			WriteJSON(v any) error
-		}) error {
-			tools := registry.Tools()
-			meta := make([]protocol.ToolMeta, 0, len(tools))
-			for _, t := range tools {
-				meta = append(meta, protocol.ToolMeta{
-					Name:        t.Name,
-					Description: t.Description,
-					InputSchema: t.InputSchema,
-				})
-			}
-			return conn.WriteJSON(protocol.ToolList{Tools: meta}.ToEnvelope())
-		},
+		PostConnect: postConnectToolList(registry),
 		Handler: func(ctx context.Context, cmd protocol.Command) protocol.Result {
 			return dispatch(ctx, registry, cmd)
 		},
@@ -169,10 +156,60 @@ func main() {
 		fatal(err)
 	}
 
+	// reload_config hooks. dbReloader closes and re-wires the DB
+	// connectors from the swapped config (same eager-ping-but-not-fatal
+	// semantics as startup); toolsChanged pushes a fresh ToolList on the
+	// live connection so the server's cached tool list updates without a
+	// reconnect (server handles TypeToolList frames any time).
+	registry.SetDBReloader(func() {
+		for _, name := range []string{"esb_db_operator", "erp_db_operator"} {
+			registry.CloseDB(name)
+		}
+		if cfg.ESB != nil && cfg.ESB.IsEnabled() {
+			wireDB(ctx, logger, registry, "esb_db_operator", cfg.ESB)
+		}
+		if cfg.ERP != nil && cfg.ERP.IsEnabled() {
+			wireDB(ctx, logger, registry, "erp_db_operator", cfg.ERP)
+		}
+	})
+	registry.SetToolsChanged(func() error {
+		if err := client.PushToolList(toolMetas(registry)); err != nil {
+			logger.Printf("warn: reload_config: tool list push failed (will re-send on next reconnect): %v", err)
+			return err
+		}
+		return nil
+	})
+
 	if err := client.Run(ctx); err != nil && err != context.Canceled {
 		fatal(err)
 	}
 	logger.Printf("helper: stopped")
+}
+
+// toolMetas snapshots the registry's current tool list as wire metadata.
+// Shared by PostConnect (every reconnect) and reload_config's push so
+// both advertise exactly the same thing.
+func toolMetas(reg *actions.Registry) []protocol.ToolMeta {
+	tools := reg.Tools()
+	meta := make([]protocol.ToolMeta, 0, len(tools))
+	for _, t := range tools {
+		meta = append(meta, protocol.ToolMeta{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+		})
+	}
+	return meta
+}
+
+// postConnectToolList returns the PostConnect callback that advertises
+// the tool list right after the server accepts Hello.
+func postConnectToolList(reg *actions.Registry) wsclient.PostConnect {
+	return func(conn interface {
+		WriteJSON(v any) error
+	}) error {
+		return conn.WriteJSON(protocol.ToolList{Tools: toolMetas(reg)}.ToEnvelope())
+	}
 }
 
 // logStartupWarnings surfaces missing/invalid configured paths right in

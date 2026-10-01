@@ -264,3 +264,18 @@ func (c *Client) Current() (protocol.Hello, bool) {
 	}
 	return *p, true
 }
+
+// PushToolList sends a fresh ToolList envelope on the live connection so
+// the server can refresh its cached tool list without a reconnect. The
+// server's read loop dispatches frames by type, so a mid-connection
+// TypeToolList frame is handled exactly like the one PostConnect sends.
+// Used by reload_config after the registry's tool set changed.
+func (c *Client) PushToolList(tools []protocol.ToolMeta) error {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return errors.New("wsclient: not connected")
+	}
+	return c.writeJSON(conn, protocol.ToolList{Tools: tools}.ToEnvelope())
+}

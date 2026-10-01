@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -36,6 +37,22 @@ type Registry struct {
 	uploads  *uploadRegistry
 	dbops    map[string]dbop.Op // keyed by tool name ("esb_db_operator", "erp_db_operator")
 	tasks    *taskRegistry      // long-running composite actions (deploy) for task_status polling
+
+	// reloadMu serializes reload_config runs so two concurrent reloads
+	// cannot interleave their cfg/dbops swaps.
+	reloadMu sync.Mutex
+	// configPath is the absolute path of config.json; set via
+	// WithConfigPath. Empty (tests constructing Registry directly) makes
+	// reload_config return a clear error instead of a panic.
+	configPath string
+	// dbReloader is injected by main: closes old connectors and re-wires
+	// them from the freshly swapped config. Runs under reloadMu.
+	dbReloader func()
+	// toolsChanged is injected by main: pushes a fresh ToolList to the
+	// server so tool availability updates without a reconnect. Runs
+	// outside reloadMu; its error is reported in the reload reply, not
+	// fatal — the list re-sends on the next reconnect anyway.
+	toolsChanged func() error
 }
 
 // Probe abstracts OS-level introspection. Production uses OSProbe; tests
@@ -87,6 +104,33 @@ func (r *Registry) WithDB(toolName string, op dbop.Op) *Registry {
 	r.dbops[toolName] = op
 	return r
 }
+
+// CloseDB closes and unregisters the connector for toolName. Reports
+// whether a connector was present. Used by reload_config (via the
+// dbReloader hook) so rebuilt connectors release their pools.
+func (r *Registry) CloseDB(toolName string) bool {
+	op, ok := r.dbops[toolName]
+	if !ok {
+		return false
+	}
+	delete(r.dbops, toolName)
+	if op != nil {
+		_ = op.Close()
+	}
+	return true
+}
+
+// WithConfigPath records where config.json lives, enabling reload_config.
+func (r *Registry) WithConfigPath(p string) *Registry { r.configPath = p; return r }
+
+// SetDBReloader injects the hook that rebuilds DB connectors after a
+// config swap. It runs under reloadMu; a nil hook makes reload_config
+// swap the config without touching connectors.
+func (r *Registry) SetDBReloader(f func()) { r.dbReloader = f }
+
+// SetToolsChanged injects the hook fired after a successful reload; main
+// uses it to push a fresh ToolList to the server.
+func (r *Registry) SetToolsChanged(f func() error) { r.toolsChanged = f }
 
 // CleanupStaleUploads removes upload sessions that have been idle for
 // longer than maxAge. Should be called periodically (e.g. every 5 min)
@@ -145,6 +189,8 @@ func (r *Registry) Dispatch(ctx context.Context, name string, params json.RawMes
 		return r.cancelUpload(params)
 	case "validate_config":
 		return r.validateConfig(ctx)
+	case "reload_config":
+		return r.reloadConfig(ctx)
 	case "upload_guide":
 		return r.uploadGuide(params)
 	case "esb_db_operator", "erp_db_operator":
