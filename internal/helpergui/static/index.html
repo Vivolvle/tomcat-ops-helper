@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tomcat 运维助手 · 配置管理</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#e3e8ee;--txt:#1f2933;--muted:#6b7580;--acc:#1a73e8;--ok:#188038;--bad:#d93025;--warn:#e37400}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:var(--txt);background:var(--bg)}
+header{display:flex;align-items:center;gap:14px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:16px;margin:0;flex:0 0 auto}
+.lamp{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+.dot{width:10px;height:10px;border-radius:50%;background:#9aa5b1;display:inline-block}
+.dot.run{background:var(--ok)} .dot.ext{background:var(--warn)}
+.spacer{flex:1}
+button{font:inherit;padding:6px 16px;border:1px solid var(--line);border-radius:6px;background:var(--card);cursor:pointer}
+button:hover{border-color:var(--acc);color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button.primary:hover{opacity:.9;color:#fff}
+button.danger{border-color:var(--bad);color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+nav{display:flex;gap:4px;padding:0 20px;background:var(--card);border-bottom:1px solid var(--line)}
+nav a{padding:10px 16px;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;text-decoration:none}
+nav a.on{color:var(--acc);border-bottom-color:var(--acc);font-weight:600}
+main{padding:20px;max-width:960px;margin:0 auto}
+section{display:none}
+section.on{display:block}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin-bottom:16px}
+.card h3{margin:0 0 12px;font-size:15px}
+.card h3 .sub{font-weight:400;color:var(--muted);font-size:12px;margin-left:8px}
+.row{display:flex;align-items:center;gap:10px;margin:10px 0;flex-wrap:wrap}
+.row label{width:150px;flex:0 0 auto;color:var(--muted)}
+.row input[type=text],.row input[type=password],.row input[type=number],.row select{flex:1;min-width:200px;font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:6px}
+.row input:focus{outline:2px solid #c6dafc;border-color:var(--acc)}
+.row .btn-sm{padding:5px 10px;font-size:13px;flex:0 0 auto}
+.hint{font-size:12px;color:var(--muted);margin:4px 0 0 160px}
+.result{margin:8px 0 0 160px;font-size:13px;min-height:20px}
+.result.ok{color:var(--ok)} .result.bad{color:var(--bad)} .result.wait{color:var(--muted)}
+.list-row{display:flex;align-items:center;gap:8px;margin:6px 0}
+.list-row input{flex:1;font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:6px}
+.list-row .x{color:var(--bad);cursor:pointer;border:none;background:none;font-size:16px;padding:2px 8px}
+.dbcard{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.dbcard.off{opacity:.55}
+.checkline{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.muted{color:var(--muted);font-size:12px}
+#logbox{background:#101418;color:#d5dbE3;font:12px/1.5 Consolas,monospace;padding:12px;border-radius:8px;height:420px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+#logbox .sys{color:#7fd1ff} #logbox .err{color:#ff8a80}
+.logtools{display:flex;gap:14px;align-items:center;margin-bottom:8px;font-size:13px;color:var(--muted)}
+footer{padding:10px 20px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);background:var(--card)}
+footer .dirty{color:var(--warn);font-weight:600}
+/* folder modal */
+#modal{position:fixed;inset:0;background:rgba(15,23,32,.45);display:none;align-items:center;justify-content:center;z-index:20}
+#modal.on{display:flex}
+#modal .box{width:520px;max-height:70vh;background:var(--card);border-radius:10px;display:flex;flex-direction:column;overflow:hidden}
+#modal .head{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);font-weight:600}
+#modal .crumb{flex:1;font-weight:400;color:var(--muted);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#modal .list{flex:1;overflow:auto;padding:6px 0}
+#modal .list div{padding:7px 18px;cursor:pointer;display:flex;gap:8px;align-items:center}
+#modal .list div:hover{background:#eef3fb}
+#modal .foot{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:10px;justify-content:flex-end}
+</style>
+</head>
+<body>
+<header>
+  <h1>Tomcat 运维助手 · 配置管理</h1>
+  <span class="lamp"><span class="dot" id="lamp"></span><span id="lampText">检查中…</span></span>
+  <span class="spacer"></span>
+  <button class="primary" id="btnSave">保存配置</button>
+  <button id="btnStart">启动 helper</button>
+  <button id="btnStop" class="danger">停止 helper</button>
+</header>
+<nav>
+  <a data-tab="conn" class="on">连接</a><a data-tab="paths">路径</a><a data-tab="db">数据库</a><a data-tab="adv">高级</a><a data-tab="logs">日志</a>
+</nav>
+<main>
+
+<section id="tab-conn" class="on">
+  <div class="card">
+    <h3>服务器连接</h3>
+    <div class="row"><label>服务器地址</label><input type="text" id="server_url" placeholder="wss://xxxx.trycloudflare.com/ws(必须以 /ws 结尾)"><button class="btn-sm" onclick="testServer()">测试连接</button></div>
+    <div class="result" id="r-server"></div>
+    <div class="row"><label>访问令牌 token</label><input type="password" id="token" autocomplete="off"><label style="width:auto"><input type="checkbox" onchange="document.getElementById('token').type=this.checked?'text':'password'">显示</label></div>
+    <div class="row"><label>本机标识 client_id</label><input type="text" id="client_id" placeholder="留空则默认使用计算机名"></div>
+    <div class="row"><label>跳过证书校验</label><input type="checkbox" id="insecure_skip_verify"><span class="muted">服务器使用自签名证书时勾选</span></div>
+    <p class="hint">服务器地址 / 令牌 / 心跳 修改保存后需重启 helper 才生效;其余字段可通过运维端 reload_config 热生效。</p>
+  </div>
+</section>
+
+<section id="tab-paths">
+  <div class="card">
+    <h3>路径</h3>
+    <div class="row"><label>Tomcat 目录</label><input type="text" id="tomcat_home"><button class="btn-sm" onclick="browse('tomcat_home')">浏览…</button></div>
+    <div class="row"><label>JDK 目录</label><input type="text" id="jdk_home"><button class="btn-sm" onclick="browse('jdk_home')">浏览…</button></div>
+    <div class="row"><label>日志目录</label><input type="text" id="log_dir"><button class="btn-sm" onclick="browse('log_dir')">浏览…</button></div>
+    <h3 style="margin-top:18px">允许操作的目录 <span class="sub">helper 只能读写这些目录(exec / 文件上传 / 日志)</span></h3>
+    <div id="allowedList"></div>
+    <button class="btn-sm" onclick="addAllowed('+')">+ 添加目录</button>
+  </div>
+</section>
+
+<section id="tab-db">
+  <div class="dbcard" id="card-esb">
+    <div class="checkline"><input type="checkbox" id="esb-on" checked onchange="dbCardState()"><b>ESB 数据库</b><span class="muted">(MySQL,供运维端查询 ESB 库)</span>
+      <span class="spacer"></span><button class="btn-sm danger" onclick="deleteBlock('esb')">删除此数据库配置</button></div>
+    <div class="dbbody">
+      <div class="row"><label>地址</label><input type="text" id="esb-host" placeholder="10.0.0.5"></div>
+      <div class="row"><label>端口</label><input type="number" id="esb-port" placeholder="3306" style="max-width:120px;min-width:100px"><span class="muted">MySQL 默认 3306</span></div>
+      <div class="row"><label>库名</label><input type="text" id="esb-database"></div>
+      <div class="row"><label>用户名</label><input type="text" id="esb-user"></div>
+      <div class="row"><label>密码</label><input type="password" id="esb-password" autocomplete="new-password"></div>
+      <div class="checkline"><input type="checkbox" id="esb-forbid"><span>只读模式 <span class="muted">(forbid_cmd:仅允许 SELECT/SHOW/DESC/EXPLAIN)</span></span></div>
+      <div class="row"><label></label><button class="btn-sm" onclick="testDB('esb')">测试连接</button></div>
+      <div class="result" id="r-esb"></div>
+    </div>
+  </div>
+  <div class="dbcard" id="card-erp">
+    <div class="checkline"><input type="checkbox" id="erp-on" checked onchange="dbCardState()"><b>ERP 数据库</b><span class="muted">(供运维端查询 ERP 库)</span>
+      <span class="spacer"></span><button class="btn-sm danger" onclick="deleteBlock('erp')">删除此数据库配置</button></div>
+    <div class="dbbody">
+      <div class="row"><label>数据库类型</label>
+        <select id="erp-type"><option value="oracle">Oracle</option><option value="sqlserver">SQL Server</option></select></div>
+      <div class="row"><label>地址</label><input type="text" id="erp-host"></div>
+      <div class="row"><label>端口</label><input type="number" id="erp-port" style="max-width:120px;min-width:100px"><span class="muted" id="erp-port-hint">Oracle 默认 1521</span></div>
+      <div class="row"><label>库名 / 服务名</label><input type="text" id="erp-database"></div>
+      <div class="row"><label>用户名</label><input type="text" id="erp-user"></div>
+      <div class="row"><label>密码</label><input type="password" id="erp-password" autocomplete="new-password"></div>
+      <div id="erp-mssql" style="display:none">
+        <div class="row"><label>加密 encrypt</label><input type="text" id="erp-encrypt" placeholder="留空=default"></div>
+        <div class="row"><label>最低 TLS</label><input type="text" id="erp-tls_min" placeholder="如 1.0 / 1.2"></div>
+        <div class="checkline"><input type="checkbox" id="erp-trust_cert"><span>信任服务器证书 trust_cert</span></div>
+      </div>
+      <div class="checkline"><input type="checkbox" id="erp-forbid"><span>只读模式 <span class="muted">(forbid_cmd)</span></span></div>
+      <div class="row"><label></label><button class="btn-sm" onclick="testDB('erp')">测试连接</button></div>
+      <div class="result" id="r-erp"></div>
+    </div>
+  </div>
+  <div class="card"><p class="muted" style="margin:4px">取消勾选=保存为 enabled:false(保留配置但停用工具);「删除此数据库配置」=从 config.json 中移除整块。测试连接使用当前表单值,无需先保存。连接失败不会阻止 helper 启动,仅在日志中告警。</p></div>
+</section>
+
+<section id="tab-adv">
+  <div class="card">
+    <h3>高级参数</h3>
+    <div class="row"><label>命令超时(秒)</label><input type="number" id="command_timeout"></div>
+    <div class="row"><label>输出上限(字节)</label><input type="number" id="max_output_size"></div>
+    <div class="row"><label>重连间隔(秒)</label><input type="number" id="reconnect_interval"></div>
+    <div class="row"><label>心跳间隔(秒)</label><input type="number" id="heartbeat_interval"></div>
+    <div class="row"><label>心跳超时(秒)</label><input type="number" id="heartbeat_timeout"></div>
+    <div class="row"><label>审计日志文件名</label><input type="text" id="log_file"></div>
+    <div class="row"><label>Windows 服务名</label><input type="text" id="service_name" placeholder="留空=从 server.xml 自动推导"></div>
+  </div>
+  <div class="card">
+    <h3>以下字段不受本工具管理,保存时原样保留</h3>
+    <div id="unknownFields" class="muted" style="font-family:monospace;white-space:pre-wrap"></div>
+  </div>
+</section>
+
+<section id="tab-logs">
+  <div class="logtools">
+    <label><input type="checkbox" id="autoScroll" checked>自动滚动</label>
+    <button class="btn-sm" onclick="clearLog()">清屏</button>
+    <span id="logSource"></span>
+  </div>
+  <div id="logbox"></div>
+</section>
+
+</main>
+<footer>
+  <span id="cfgPath"></span> · <span id="dirtyFlag"></span> · 关闭 helper-gui 窗口会同时停止它启动的 helper
+</footer>
+
+<div id="modal">
+  <div class="box">
+    <div class="head">选择文件夹 <span class="crumb" id="mCrumb"></span></div>
+    <div class="list" id="mList"></div>
+    <div class="foot"><button onclick="modalPick()">选择当前目录</button><button class="danger" onclick="modalClose()">取消</button></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const api = (path, opts) => fetch(path, Object.assign({headers:{"X-Requested-With":"helper-gui"}}, opts||{}));
+const $ = id => document.getElementById(id);
+const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+const KNOWN = ["server_url","token","client_id","tomcat_home","jdk_home","log_dir","allowed_dirs",
+  "command_timeout","max_output_size","reconnect_interval","heartbeat_interval","heartbeat_timeout",
+  "log_file","insecure_skip_verify","service_name","esb","erp"];
+let doc = null, dirty = false, cfgPath = "", helperExists = false;
+let pollTimer = null, logCursor = 0, tailOffset = 0, logMode = "";
+const deleted = {esb:false, erp:false};
+
+/* ---------- init ---------- */
+document.querySelectorAll("nav a").forEach(a => a.onclick = () => {
+  document.querySelectorAll("nav a").forEach(x => x.classList.remove("on"));
+  document.querySelectorAll("main section").forEach(x => x.classList.remove("on"));
+  a.classList.add("on"); $("tab-"+a.dataset.tab).classList.add("on");
+  if (a.dataset.tab === "logs") startLogPolling(); else stopLogPolling();
+});
+document.querySelectorAll("input,select").forEach(el => el.addEventListener("input", markDirty));
+$("btnSave").onclick = save; $("btnStart").onclick = start; $("btnStop").onclick = stop;
+window.addEventListener("beforeunload", e => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+loadConfig(); pollStatus(); setInterval(pollStatus, 2000);
+
+async function loadConfig() {
+  try {
+    const r = await (await api("/api/config")).json();
+    cfgPath = r.path; helperExists = r.helper_exists;
+    doc = r.doc || {};
+    $("cfgPath").textContent = cfgPath + (r.exists ? "" : "(尚未创建,保存后生成)");
+    bind();
+    const unk = Object.keys(doc).filter(k => !KNOWN.includes(k));
+    $("unknownFields").textContent = unk.length ? unk.map(k => k + " = " + JSON.stringify(doc[k])).join("\n") : "(无)";
+    if (!helperExists) note("未找到 helper.exe,请把它放在本程序同目录");
+  } catch (e) { note("读取配置失败: " + e); }
+}
+
+function bind() {
+  const str = id => $(id).value = doc[id] != null ? String(doc[id]) : "";
+  str("server_url"); str("token"); str("client_id"); str("tomcat_home"); str("jdk_home"); str("log_dir");
+  str("command_timeout"); str("max_output_size"); str("reconnect_interval"); str("heartbeat_interval"); str("heartbeat_timeout");
+  str("log_file"); str("service_name");
+  $("insecure_skip_verify").checked = !!doc.insecure_skip_verify;
+  // allowed_dirs
+  $("allowedList").innerHTML = "";
+  (Array.isArray(doc.allowed_dirs) ? doc.allowed_dirs : []).forEach(d => addAllowedRow(d));
+  // db blocks
+  bindDB("esb", doc.esb); bindDB("erp", doc.erp);
+  dbCardState();
+  dirty = false; markDirty();
+}
+
+function bindDB(p, blk) {
+  const on = $(p+"-on"), has = !!blk;
+  deleted[p] = false;
+  on.checked = has ? (blk.enabled !== false) : true;
+  on.closest(".dbcard").style.display = has ? "" : "none";
+  if (!has) return;
+  $(p+"-host").value = blk.host || ""; $(p+"-port").value = blk.port || "";
+  $(p+"-database").value = blk.database || ""; $(p+"-user").value = blk.user || "";
+  $(p+"-password").value = blk.password || ""; $(p+"-forbid").checked = !!blk.forbid_cmd;
+  if (p === "erp") {
+    $(p+"-type").value = (blk.type || "oracle");
+    $(p+"-encrypt").value = blk.encrypt || ""; $(p+"-tls_min").value = blk.tls_min || "";
+    $(p+"-trust_cert").checked = !!blk.trust_cert;
+  }
+  mssqlToggle();
+}
+function mssqlToggle() {
+  const isMssql = $("erp-type").value === "sqlserver";
+  $("erp-mssql").style.display = isMssql ? "" : "none";
+  $("erp-port-hint").textContent = isMssql ? "SQL Server 默认 1433" : "Oracle 默认 1521";
+}
+$("erp-type").addEventListener("change", mssqlToggle);
+function dbCardState() {
+  ["esb","erp"].forEach(p => $( "card-"+p).classList.toggle("off", !$(p+"-on").checked));
+}
+
+/* ---------- dirty ---------- */
+function markDirty() {
+  dirty = true;
+  $("dirtyFlag").textContent = "● 有未保存的更改"; $("dirtyFlag").className = "dirty";
+}
+function clearDirty() { dirty = false; $("dirtyFlag").textContent = "配置已保存"; $("dirtyFlag").className = ""; }
+
+function addAllowedRow(v) {
+  const div = document.createElement("div"); div.className = "list-row";
+  div.innerHTML = '<input type="text"><button class="btn-sm" onclick="browseRow(this)">浏览…</button><button class="x" onclick="this.parentNode.remove();markDirty()">✕</button>';
+  div.querySelector("input").value = v || ""; div.querySelector("input").addEventListener("input", markDirty);
+  $("allowedList").appendChild(div);
+}
+function addAllowed() { addAllowedRow(""); }
+
+/* ---------- save ---------- */
+function num(id) { const v = $(""+id).value.trim(); return v === "" ? undefined : Number(v); }
+function optionalStr(id, key) {
+  const v = $(""+id).value.trim();
+  if (v !== "") return v;
+  return doc && doc[key] != null ? "" : undefined;   // clear an existing value, don't add a new empty one
+}
+function collectDB(p) {
+  if (deleted[p]) return null;                                  // user clicked 删除 → remove the block
+  if ($( "card-"+p).style.display === "none") return doc && doc[p] ? doc[p] : undefined; // untouched & absent
+  if (!$(p+"-on").checked) { const b = collectDBBody(p); b.enabled = false; return b; }
+  return collectDBBody(p);
+}
+function collectDBBody(p) {
+  const b = { host: $(p+"-host").value.trim(), port: Number($(p+"-port").value) || 0,
+    database: $(p+"-database").value.trim(), user: $(p+"-user").value.trim(), password: $(p+"-password").value };
+  if (p === "erp") {
+    b.type = $("erp-type").value;
+    if (b.type === "sqlserver") {
+      if ($("erp-encrypt").value.trim()) b.encrypt = $("erp-encrypt").value.trim();
+      if ($("erp-tls_min").value.trim()) b.tls_min = $("erp-tls_min").value.trim();
+      if ($("erp-trust_cert").checked) b.trust_cert = true;
+    }
+  }
+  if ($(p+"-forbid").checked) b.forbid_cmd = true;
+  return b;
+}
+async function save() {
+  const fields = {
+    server_url: $("server_url").value.trim(),
+    token: $("token").value.trim(),
+    client_id: optionalStr("client_id","client_id"),
+    tomcat_home: $("tomcat_home").value.trim(),
+    jdk_home: $("jdk_home").value.trim(),
+    log_dir: $("log_dir").value.trim(),
+    allowed_dirs: [...document.querySelectorAll("#allowedList input")].map(i => i.value.trim()).filter(Boolean),
+    command_timeout: num("command_timeout"), max_output_size: num("max_output_size"),
+    reconnect_interval: num("reconnect_interval"), heartbeat_interval: num("heartbeat_interval"),
+    heartbeat_timeout: num("heartbeat_timeout"),
+    log_file: optionalStr("log_file","log_file"), service_name: optionalStr("service_name","service_name"),
+    insecure_skip_verify: $("insecure_skip_verify").checked,
+    esb: collectDB("esb"), erp: collectDB("erp"),
+  };
+  Object.keys(fields).forEach(k => fields[k] === undefined && delete fields[k]);
+  $("btnSave").disabled = true;
+  try {
+    const r = await (await api("/api/config", {method:"POST", headers:{"Content-Type":"application/json","X-Requested-With":"helper-gui"}, body: JSON.stringify({fields})})).json();
+    if (!r.ok) { alert("保存失败(文件未改动):\n\n" + r.error); return; }
+    clearDirty(); await loadConfig();
+    if (r.restart_required && $("lamp").classList.contains("run")) alert("已保存。服务器地址/令牌/心跳类字段需重启 helper 后生效。");
+    else note(r.restart_required ? "已保存(下次启动 helper 生效)" : "已保存");
+  } catch (e) { alert("保存失败: " + e); }
+  finally { $("btnSave").disabled = false; }
+}
+
+/* ---------- tests ---------- */
+async function testServer() {
+  const el = $("r-server"); el.className = "result wait"; el.textContent = "连接中…";
+  try {
+    const r = await (await api("/api/test/server", {method:"POST", headers:{"Content-Type":"application/json","X-Requested-With":"helper-gui"},
+      body: JSON.stringify({server_url: $("server_url").value.trim(), token: $("token").value.trim(), insecure_skip_verify: $("insecure_skip_verify").checked})})).json();
+    if (r.ok) { el.className = "result ok"; el.textContent = "✓ 连接成功 (" + r.latency_ms + "ms) — 地址、路径、证书与令牌均正确"; }
+    else { el.className = "result bad"; el.textContent = "✗ " + ({auth:"令牌不对", not_found:"路径不对(需以 /ws 结尾)", handshake:"服务器响应异常", tls:"证书校验失败", timeout:"连接超时", dial:"无法连接", bad_url:"地址格式不对"}[r.code] || r.code) + (r.detail ? " — " + r.detail : ""); }
+  } catch (e) { el.className = "result bad"; el.textContent = "✗ " + e; }
+}
+async function testDB(p) {
+  const el = $("r-"+p); el.className = "result wait"; el.textContent = "连接中…";
+  try {
+    const r = await (await api("/api/test/db", {method:"POST", headers:{"Content-Type":"application/json","X-Requested-With":"helper-gui"},
+      body: JSON.stringify({block: p, cfg: collectDBBody(p)})})).json();
+    if (r.ok) { el.className = "result ok"; el.textContent = "✓ 连接成功 (" + r.driver + ", " + r.latency_ms + "ms)"; }
+    else { el.className = "result bad"; el.textContent = "✗ " + (r.error_kind === "validate" ? "配置不完整: " : "连接失败: ") + r.error; }
+  } catch (e) { el.className = "result bad"; el.textContent = "✗ " + e; }
+}
+function deleteBlock(p) {
+  if (!confirm("确定从 config.json 中删除该数据库配置块吗?")) return;
+  deleted[p] = true;
+  $( "card-"+p).style.display = "none"; markDirty();
+}
+
+/* ---------- folder picker ---------- */
+let pickTarget = null, mPath = "", mParent = null, pickRow = null;
+function browse(id) { pickTarget = id; pickRow = null; modalOpen(""); }
+function browseRow(btn) { pickRow = btn.parentNode.querySelector("input"); pickTarget = null; modalOpen(""); }
+async function modalOpen(path) {
+  $("modal").classList.add("on");
+  try {
+    const r = await (await api("/api/fs/dirs" + (path ? "?path=" + encodeURIComponent(path) : ""))).json();
+    if (!r.ok) { alert(r.error); modalClose(); return; }
+    mPath = r.path || ""; mParent = r.parent || null;
+    $("mCrumb").textContent = mPath || "驱动器列表";
+    const list = $("mList"); list.innerHTML = "";
+    if (mPath === "" || mParent !== null) {
+      const up = document.createElement("div");
+      up.innerHTML = "📁 " + (mPath === "" ? "" : "⬑ " + (mParent || ".."));
+      up.onclick = () => modalOpen(mPath === "" ? "" : (mParent || ""));
+      if (mPath !== "") list.appendChild(up);
+    }
+    r.entries.forEach(e => {
+      const d = document.createElement("div");
+      d.innerHTML = "📁 " + esc(e.name);
+      d.onclick = () => modalOpen(e.path);
+      list.appendChild(d);
+    });
+    if (!r.entries.length && mPath) { const d = document.createElement("div"); d.innerHTML = '<span class="muted">(没有子目录)</span>'; list.appendChild(d); }
+  } catch (e) { alert("读取目录失败: " + e); modalClose(); }
+}
+function modalPick() {
+  if (mPath === "") { alert("请先进入一个具体目录"); return; }
+  if (pickRow) pickRow.value = mPath; else if (pickTarget) $(pickTarget).value = mPath;
+  markDirty(); modalClose();
+}
+function modalClose() { $("modal").classList.remove("on"); }
+
+/* ---------- process & logs ---------- */
+let running = false, source = "none";
+async function pollStatus() {
+  try {
+    const r = await (await api("/api/proc/status")).json();
+    running = r.running; source = r.source;
+    const lamp = $("lamp"), t = $("lampText");
+    lamp.className = "dot" + (r.running ? (r.source === "gui" ? " run" : " ext") : "");
+    if (r.running && r.source === "gui") t.textContent = "运行中 (PID " + r.pid + ")";
+    else if (r.running) t.textContent = "外部实例运行中 (PID " + r.pid + ",停止按钮不可用)";
+    else t.textContent = "已停止" + (r.exit_code != null ? " (exit " + r.exit_code + ")" : "");
+    $("btnStop").disabled = !(r.running && r.source === "gui");
+    $("btnStart").disabled = r.running;
+    if ($("tab-logs").classList.contains("on")) startLogPolling();
+  } catch (e) { /* transient */ }
+}
+async function start() {
+  if (dirty && !confirm("当前有未保存的更改,启动将使用【已保存】的配置。继续?")) return;
+  try {
+    const r = await (await api("/api/proc/start", {method:"POST"})).json();
+    if (!r.ok) alert("启动失败: " + r.error);
+    pollStatus();
+  } catch (e) { alert("启动失败: " + e); }
+}
+async function stop() {
+  if (!confirm("确定停止 helper 吗?正在执行的运维命令会被终止。")) return;
+  try {
+    const r = await (await api("/api/proc/stop", {method:"POST"})).json();
+    if (!r.ok) alert("停止失败: " + r.error);
+    pollStatus();
+  } catch (e) { alert("停止失败: " + e); }
+}
+
+function startLogPolling() {
+  stopLogPolling();
+  const guiMode = source !== "external";
+  if (logMode !== (guiMode ? "gui" : "tail")) { logMode = guiMode ? "gui" : "tail"; logCursor = 0; tailOffset = 0; }
+  $("logSource").textContent = guiMode ? "来源:helper 实时输出" : "helper 非本界面启动 — 来源:审计日志 helper.log";
+  const tick = guiMode ? pollRing : pollTail;
+  tick(); pollTimer = setInterval(tick, guiMode ? 1000 : 2000);
+}
+function stopLogPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+async function pollRing() {
+  try {
+    const r = await (await api("/api/proc/logs?since=" + logCursor)).json();
+    if (!r.ok) return;
+    if (r.wrapped) appendLog(["…(部分日志已滚动丢弃)…"], "sys");
+    r.lines.forEach(l => appendLog([l.ts.slice(11,19) + " " + l.text], l.stream === "system" ? "sys" : ""));
+    logCursor = r.next || logCursor;
+  } catch (e) {}
+}
+async function pollTail() {
+  try {
+    const r = await (await api("/api/logs/tail?offset=" + tailOffset)).json();
+    if (!r.ok) return;
+    r.lines.forEach(l => appendLog([(l.ts || "").replace("T"," ").slice(0,19) + " " + (l.cmd || l.raw) + (l.error ? "  ✗" + l.error : "")], ""));
+    tailOffset = r.offset;
+  } catch (e) {}
+}
+function appendLog(lines, cls) {
+  const box = $("logbox"), atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  lines.forEach(t => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = t; box.appendChild(d); });
+  while (box.childNodes.length > 5000) box.removeChild(box.firstChild);
+  if ($("autoScroll").checked && atBottom) box.scrollTop = box.scrollHeight;
+}
+function clearLog() { $("logbox").innerHTML = ""; }
+
+function note(msg) { $("logSource").textContent = msg; }
+</script>
+</body>
+</html>
