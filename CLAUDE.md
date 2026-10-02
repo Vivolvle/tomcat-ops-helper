@@ -25,6 +25,7 @@ go vet ./...
 go build -ldflags="-s -w" -o bin/helper.exe ./cmd/helper
 go build -ldflags="-s -w" -o bin/server.exe ./cmd/server
 go build -ldflags="-s -w" -o bin/mcpstdio.exe ./cmd/mcpstdio
+go build -ldflags="-s -w" -o bin/helper-gui.exe ./cmd/helper-gui
 go run ./cmd/gencert                   # one-time self-signed certs into certs/
 ```
 
@@ -44,7 +45,8 @@ go run ./cmd/gencert                   # one-time self-signed certs into certs/
 - `internal/execshell/` — controlled shell: `Runner` interface, production `OSRunner`, command blacklist, audit.
 - `internal/config/` — helper `config.json` load + `Validate`.
 - `internal/wsclient/` / `internal/wsserver/` — websocket layers (reconnect+heartbeat / Hello-Result-ToolList routing), tested against `httptest.Server`.
-- `cmd/helper`, `cmd/server`, `cmd/mcpstdio`, `cmd/gencert`.
+- `internal/helpergui/` — the customer-facing local web UI served by helper-gui.exe (config editor, connection tests, launcher, log pane); all handlers are methods on `*Server` tested via httptest.
+- `cmd/helper`, `cmd/server`, `cmd/mcpstdio`, `cmd/gencert`, `cmd/helper-gui`.
 
 **Testability design:** every OS-touching surface is an interface so unit tests use fakes — `execshell.Runner` (tests use `fakeRunner`), `actions.Probe` (production `OSProbe` uses PowerShell; tests seed `fakeProbe`), and real gorilla/websocket against `httptest.Server`. `cmd/helper/dispatch_test.go` exercises real dispatch with `t.TempDir()`. Follow this pattern in new code.
 
@@ -63,6 +65,7 @@ go run ./cmd/gencert                   # one-time self-signed certs into certs/
 - **deploy runs as a tracked task** (sync or async — the reply always carries a `task_id`). With `"async": true` it returns immediately; poll `task_status` (omit `task_id` to list recent tasks, e.g. after a timed-out call). The background worker runs detached on a 30-minute budget, so an MCP timeout mid-deploy no longer strands the box in a stopped state.
 - **`forbid_cmd` read-only lock**: `"forbid_cmd": true` inside the `esb`/`erp` config block locks that connector read-only — `Exec` refuses everything, and `Query` additionally enforces a narrow allowlist (`SELECT` / `SHOW` / `DESC` / `DESCRIBE` / `EXPLAIN SELECT` / `EXPLAIN ANALYZE SELECT`), so `WITH … DELETE`-style statements the router would call queries are rejected too, as are `EXPLAIN DELETE` and `SELECT … INTO OUTFILE`. A locked connector announces itself in the tool description ("READ-ONLY: …"), the startup log (`… connected (…, read-only)`), `validate_config` (`connectors.<name>.read_only`), and every response (`read_only: true`); policy rejections don't count as connector failures.
 - Default helper.exe is built **with console** for visibility; for stealth rebuild with `-ldflags="-H windowsgui -s -w"`.
+- **helper-gui.exe** is the customer-side front door: double-click → local Chinese web UI on `127.0.0.1:7788` (random-port fallback; browser auto-opens). Visual config.json editing with server-side directory-tree folder pickers, 测试连接 for DB blocks (reuses `dbop.NewSQLOp` — same DSN logic as production) and for `server_url` (real ws handshake, classifies auth/404/tls/timeout/dial), atomic validated saves that preserve unknown JSON fields, plus a launcher (child helper.exe with piped stdio into a ring; stop = `taskkill /PID n /T /F`; external instances detected via tasklist → log pane tails helper.log instead). All `/api/*` routes require the `X-Requested-With: helper-gui` header (local CSRF guard). **Agent-side config edits still go through `write_file` + `reload_config`** — the GUI is for humans.
 
 ## Driving the helper via MCP (rules & recipes)
 
@@ -85,12 +88,13 @@ Whenever helper source changes (new tool, bug fix), go through this checklist en
 
    ```powershell
    Copy-Item -Force .\bin\helper.exe .\out\helper-client\helper.exe
+   Copy-Item -Force .\bin\helper-gui.exe .\out\helper-client\helper-gui.exe
    $a = (Get-FileHash .\bin\helper.exe).Hash
    $b = (Get-FileHash '.\out\helper-client\helper.exe').Hash
    if ($a -ne $b) { throw "staging helper.exe sha256 mismatch: $a vs $b" }
    ```
 
-   `out/` is gitignored on purpose — it carries the real-token config.json and the 14 MB exe; never commit it. When a config field changes for a deployment, edit `out/helper-client/config.json` there too (and after rollout, confirm with `validate_config` / `reload_config`).
+   `out/` is gitignored on purpose — it carries the real-token config.json and the 14 MB exe; never commit it. The bundle README's tracked source is `deploy/helper-client-README.md` — edit that, then copy it to `out/helper-client/README.md`. When a config field changes for a deployment, edit `out/helper-client/config.json` there too (and after rollout, confirm with `validate_config` / `reload_config`).
 
 3. **Hand off to customer box** — copy to `D:\bs-esb\helper-client\helper.exe` on the helper host. Same sha256 expected.
 4. **Restart helper** — kill the running `helper.exe` (taskkill /F /IM helper.exe, or close the run-helper.ps1 console), then start `D:\bs-esb\helper-client\run-helper.ps1`.

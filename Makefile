@@ -1,8 +1,8 @@
-.PHONY: build test clean helper server
+.PHONY: build test clean helper server helper-gui
 
 BIN ?= bin
 
-build: helper server test
+build: helper server helper-gui test
 
 helper:
 	mkdir -p $(BIN)
@@ -11,6 +11,10 @@ helper:
 server:
 	mkdir -p $(BIN)
 	go build -trimpath -ldflags="-s -w" -o $(BIN)/server ./cmd/server
+
+helper-gui:
+	mkdir -p $(BIN)
+	go build -trimpath -ldflags="-s -w" -o $(BIN)/helper-gui ./cmd/helper-gui
 
 test:
 	go test ./...

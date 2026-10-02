@@ -19,6 +19,10 @@ echo === building server ===
 go build -trimpath -ldflags="-s -w" -o bin\server.exe .\cmd\server
 if errorlevel 1 exit /b 1
 
+echo === building helper-gui ===
+go build -trimpath -ldflags="-s -w" -o bin\helper-gui.exe .\cmd\helper-gui
+if errorlevel 1 exit /b 1
+
 echo === running tests ===
 go test ./...
 if errorlevel 1 exit /b 1
