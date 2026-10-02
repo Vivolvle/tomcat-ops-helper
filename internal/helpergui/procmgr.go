@@ -172,6 +172,7 @@ func (pm *ProcManager) Status() ProcState {
 		st.Source = SourceExternal
 		st.Running = true
 		st.PID = pids[0]
+		st.ExitCode = nil // a stale code from a previous GUI child would contradict running:true
 	}
 	return st
 }
