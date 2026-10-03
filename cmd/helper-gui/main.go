@@ -5,7 +5,7 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -59,29 +59,24 @@ func main() {
 	}
 
 	// Ctrl+C and console-window close both arrive here; stop our helper
-	// child cleanly before exiting.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// child cleanly, then close the listener so Serve returns and the
+	// process actually exits. Without the Close, Serve blocked forever
+	// and the console window only went away when Windows force-killed
+	// us ~5s after the close event.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	httpSrv := &http.Server{Handler: srv.Handler()}
 	go func() {
 		s := <-sigs
 		log.Printf("helper-gui: 收到信号 %s,正在停止 helper…", s)
 		srv.Shutdown()
-		cancel()
-	}()
-	go func() {
-		<-ctx.Done()
-		srv.Shutdown()
+		_ = httpSrv.Close()
 	}()
 
-	if err := http.Serve(l, srv.Handler()); err != nil {
-		if ctx.Err() != nil {
-			log.Printf("helper-gui: 已退出")
-			return
-		}
+	if err := httpSrv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fatal(err)
 	}
+	log.Printf("helper-gui: 已退出")
 }
 
 func fatal(err error) {
