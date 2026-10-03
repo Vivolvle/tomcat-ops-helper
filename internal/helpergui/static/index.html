@@ -47,8 +47,8 @@ section.on{display:block}
 #logbox{background:#101418;color:#d5dbE3;font:12px/1.5 Consolas,monospace;padding:12px;border-radius:8px;height:420px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 #logbox .sys{color:#7fd1ff} #logbox .err{color:#ff8a80}
 .logtools{display:flex;gap:14px;align-items:center;margin-bottom:8px;font-size:13px;color:var(--muted)}
-footer{padding:10px 20px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);background:var(--card)}
-footer .dirty{color:var(--warn);font-weight:600}
+.meta{color:var(--muted);font-size:12px;min-width:0}
+.meta .dirty{color:var(--warn);font-weight:600}
 /* folder modal */
 #modal{position:fixed;inset:0;background:rgba(15,23,32,.45);display:none;align-items:center;justify-content:center;z-index:20}
 #modal.on{display:flex}
@@ -65,6 +65,7 @@ footer .dirty{color:var(--warn);font-weight:600}
 <header>
   <h1>Tomcat 运维助手 · 配置管理</h1>
   <span class="lamp"><span class="dot" id="lamp"></span><span id="lampText">检查中…</span></span>
+  <span class="meta"><span id="cfgPath"></span> · <span id="dirtyFlag"></span> · 关闭 helper-gui 窗口会同时停止它启动的 helper</span>
   <span class="spacer"></span>
   <button class="primary" id="btnSave">保存配置</button>
   <button id="btnStart">启动 helper</button>
@@ -165,9 +166,6 @@ footer .dirty{color:var(--warn);font-weight:600}
 </section>
 
 </main>
-<footer>
-  <span id="cfgPath"></span> · <span id="dirtyFlag"></span> · 关闭 helper-gui 窗口会同时停止它启动的 helper
-</footer>
 
 <div id="modal">
   <div class="box">
