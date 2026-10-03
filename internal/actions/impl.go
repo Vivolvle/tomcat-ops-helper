@@ -318,10 +318,11 @@ func (r *Registry) startService(ctx context.Context, params json.RawMessage) (js
 	defer startCancel()
 	data.Start, err = r.executor.Exec(startCtx, fmt.Sprintf("sc start %q", serviceName), r.cfg.TomcatHome)
 	if err != nil || data.Start.ExitCode != 0 {
-		// 1056 = ERROR_SERVICE_ALREADY_RUNNING: someone else (a deploy
-		// task, a slow SCM transition) started it first. Re-check the
-		// actual state instead of failing — already RUNNING means the
-		// caller's goal is achieved (2026-09-25 report).
+		// 1056 = ERROR_SERVICE_ALREADY_RUNNING: either someone else (a
+		// deploy task, a slow SCM transition) started it first, or the
+		// service is still mid-stop. Re-check the actual state instead
+		// of failing — already RUNNING means the caller's goal is
+		// achieved (2026-09-25 report).
 		if data.Start.ExitCode == 1056 || strings.Contains(strings.ToLower(data.Start.Stdout+data.Start.Stderr), "1056") {
 			state, serr := r.queryServiceState(startCtx, serviceName)
 			switch {
@@ -337,6 +338,24 @@ func (r *Registry) startService(ctx context.Context, params json.RawMessage) (js
 					data.Note = "sc start returned 1056; service was START_PENDING and reached RUNNING"
 					return mustMarshal(data), nil
 				}
+			case serr == nil && (state == "STOP_PENDING" || state == "STOPPED"):
+				// 2026-10-03 report: procrun stops slowly — the JVM exits
+				// but the service sits in STOP_PENDING for a minute+, and
+				// sc start during that window gets 1056. Wait for the
+				// service to fully stop, then retry the start once.
+				if werr := r.waitServiceState(startCtx, serviceName, "STOPPED"); werr != nil {
+					return nil, fmt.Errorf("start_service: sc start returned 1056 while service %s was stopping (state=%s) and it did not reach STOPPED within %s: %w", serviceName, state, timeout, werr)
+				}
+				data.Start, err = r.executor.Exec(startCtx, fmt.Sprintf("sc start %q", serviceName), r.cfg.TomcatHome)
+				if err != nil || data.Start.ExitCode != 0 {
+					return nil, fmt.Errorf("start_service: service %s failed to start after waiting out a slow stop: %s", serviceName, resultMessage(data.Start, err))
+				}
+				if werr := r.waitServiceState(startCtx, serviceName, "RUNNING"); werr != nil {
+					return nil, fmt.Errorf("start_service: service %s did not reach RUNNING within %s (restart after slow stop was accepted; the JVM may still be booting — check `sc query` / catalina log): %w", serviceName, timeout, werr)
+				}
+				data.Running = true
+				data.Note = "sc start returned 1056 during the stop transition (slow procrun shutdown); waited for STOPPED and started again"
+				return mustMarshal(data), nil
 			}
 			return nil, fmt.Errorf("start_service: sc start returned 1056 but service %s is not RUNNING (state=%s, err=%v)", serviceName, state, serr)
 		}
