@@ -40,7 +40,10 @@ desktop.ini
 # Opencode local state
 .opencode/
 
-# Local staging output (out/helper-client, out/helper-server) — the sole
-# deploy staging entry point. Carries real-token config.json and 14 MB
-# exes; must never land in this repo's history.
+# Deploy staging bundles live in D:/tools (helper-client,
+# helper-client-2012r2) and carry real tokens — never commit them.
+# out/ stays ignored as a safety net for older workflows.
 out/
+
+# Operator-local MCP wiring (points at a specific helper client_id)
+.mcp.json

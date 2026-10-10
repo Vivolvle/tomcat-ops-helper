@@ -2,6 +2,7 @@ package dbop
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/microsoft/go-mssqldb/msdsn"
 
 	"tomcat-ops-helper/internal/config"
 )
@@ -465,9 +468,9 @@ func TestSQLOp_DSNBuilders(t *testing.T) {
 		{"mysql", &config.DBConfig{Host: "h", User: "u", Password: "p", Database: "d"},
 			[]string{"tcp(h:3306)/d"}}, // default port
 		{"sqlserver", &config.DBConfig{Host: "h", Port: 1433, User: "u", Password: "p", Database: "d"},
-			[]string{"server=h", "port=1433", "user+id=u", "database=d"}},
+			[]string{"sqlserver://u:p@h:1433", "database=d"}},
 		{"mssql", &config.DBConfig{Host: "h", User: "u", Password: "p", Database: "d"},
-			[]string{"server=h", "port=1433"}},
+			[]string{"sqlserver://u:p@h:1433"}},
 		{"oracle", &config.DBConfig{Host: "h", Port: 1521, User: "u", Password: "p", Database: "ORCL"},
 			[]string{"oracle://", "h:1521/ORCL"}},
 	}
@@ -634,19 +637,60 @@ func TestSQLOp_OracleDSNEscapesURLUserInfo(t *testing.T) {
 	}
 }
 
-func TestSQLOp_SQLServerTLSOptions(t *testing.T) {
+// TestSQLOp_SQLServerTLSDSNRunsThroughDriverParse feeds the built DSN to
+// the real go-mssqldb parser. Substring matching (the previous shape of
+// this test) cannot catch DSN-format bugs: an '&' joined query string
+// contains "tlsmin=1.0" yet parses as ONE giant ADO key, so no parameter
+// ever reached the driver (2026-10-10 yangwuji TLS1.0-only SQL Server).
+func TestSQLOp_SQLServerTLSDSNRunsThroughDriverParse(t *testing.T) {
 	cfg := &config.DBConfig{
-		Host: "h", User: "u", Password: "p", Database: "d",
-		Encrypt: "disable", TLSMin: "1.0", TrustCert: true, HostnameInCert: "db.internal",
+		Host: "127.0.0.1", Port: 1433, User: "sa", Password: "p?@#/ x", Database: "zyscm",
+		Encrypt: "true", TLSMin: "1.0", TrustCert: true, HostnameInCert: "db.internal",
 	}
 	dsn, err := buildDSN("sqlserver", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"encrypt=disable", "tlsmin=1.0", "trustservercertificate=true", "hostnameincertificate=db.internal"} {
-		if !strings.Contains(dsn, want) {
-			t.Fatalf("SQL Server DSN %q missing %q", dsn, want)
-		}
+	p, err := msdsn.Parse(dsn)
+	if err != nil {
+		t.Fatalf("go-mssqldb rejected DSN %q: %v", dsn, err)
+	}
+	if p.Host != "127.0.0.1" || p.Port != 1433 || p.User != "sa" || p.Password != "p?@#/ x" || p.Database != "zyscm" {
+		t.Fatalf("connection basics lost in DSN round-trip: host=%q port=%d user=%q password=%q database=%q (dsn %q)",
+			p.Host, p.Port, p.User, p.Password, p.Database, dsn)
+	}
+	if p.Encryption != msdsn.EncryptionRequired {
+		t.Fatalf("encrypt=true did not reach the driver: Encryption=%v (dsn %q)", p.Encryption, dsn)
+	}
+	if p.TLSConfig == nil || p.TLSConfig.MinVersion != tls.VersionTLS10 {
+		t.Fatalf("tlsmin=1.0 did not reach the driver: TLSConfig=%+v (dsn %q)", p.TLSConfig, dsn)
+	}
+	if !p.TLSConfig.InsecureSkipVerify {
+		t.Fatalf("trust_cert=true did not reach the driver (dsn %q)", dsn)
+	}
+	if p.TLSConfig.ServerName != "db.internal" {
+		t.Fatalf("hostname_in_cert did not reach the driver: ServerName=%q (dsn %q)", p.TLSConfig.ServerName, dsn)
+	}
+}
+
+func TestSQLOp_SQLServerDSNEncryptDisable(t *testing.T) {
+	cfg := &config.DBConfig{
+		Host: "h", Port: 1433, User: "u", Password: "p", Database: "d",
+		Encrypt: "disable",
+	}
+	dsn, err := buildDSN("sqlserver", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := msdsn.Parse(dsn)
+	if err != nil {
+		t.Fatalf("go-mssqldb rejected DSN %q: %v", dsn, err)
+	}
+	if p.Encryption != msdsn.EncryptionDisabled {
+		t.Fatalf("encrypt=disable did not reach the driver: Encryption=%v (dsn %q)", p.Encryption, dsn)
+	}
+	if p.TLSConfig != nil {
+		t.Fatalf("encrypt=disable should not build a TLS config, got %+v (dsn %q)", p.TLSConfig, dsn)
 	}
 }
 func (dbopFakeConn) Close() error               { return nil }

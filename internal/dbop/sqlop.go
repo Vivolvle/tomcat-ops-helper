@@ -515,17 +515,22 @@ func buildDSN(driver string, cfg *config.DBConfig) (string, error) {
 		return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&charset=utf8mb4&timeout=10s&readTimeout=30s&writeTimeout=30s",
 			user, pass, host, cfg.Database), nil
 	case "sqlserver", "mssql":
-		// microsoft/go-mssqldb DSN: key=value;...
-		q := url.Values{}
-		q.Set("user id", cfg.User)
-		q.Set("password", cfg.Password)
-		q.Set("database", cfg.Database)
-		if cfg.Host != "" {
-			q.Set("server", cfg.Host)
-		}
+		// microsoft/go-mssqldb DSN, URL form: sqlserver://user:pass@host:port?k=v
+		// The driver's ADO parser (used for prefix-less strings) splits on ';'
+		// only, so a bare url.Values.Encode() query string collapses into one
+		// giant key and NOTHING — not even server/user/password/database —
+		// reaches the driver. 2026-10-10 yangwuji: a TLS1.0-only SQL Server
+		// produced "server selected unsupported protocol version 301" no
+		// matter what encrypt/tls_min were set, because the whole parameter
+		// set was swallowed; the ADO fallback then dialled localhost, which
+		// is why it still managed to touch 127.0.0.1:1433 at all.
+		userinfo := url.UserPassword(cfg.User, cfg.Password).String()
+		host := cfg.Host
 		if port > 0 {
-			q.Set("port", fmt.Sprintf("%d", port))
+			host = fmt.Sprintf("%s:%d", cfg.Host, port)
 		}
+		q := url.Values{}
+		q.Set("database", cfg.Database)
 		q.Set("dial timeout", "10")
 		q.Set("connection timeout", "10")
 		if v := strings.TrimSpace(cfg.Encrypt); v != "" {
@@ -540,7 +545,7 @@ func buildDSN(driver string, cfg *config.DBConfig) (string, error) {
 		if v := strings.TrimSpace(cfg.HostnameInCert); v != "" {
 			q.Set("hostnameincertificate", v)
 		}
-		return q.Encode(), nil
+		return fmt.Sprintf("sqlserver://%s@%s?%s", userinfo, host, q.Encode()), nil
 	case "oracle":
 		// sijms/go-ora/v2 DSN: oracle://user:pass@host:port/service_name
 		// Use URL userinfo escaping so ?, #, /, spaces, @ and : cannot alter
