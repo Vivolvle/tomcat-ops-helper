@@ -252,3 +252,24 @@ go vet ./...
 - **helper 连不上**：cloudflared 没起 / `server_url` 路径没带 `/ws` /
   证书 `insecure_skip_verify` 没开。
 - **GOPROXY 被墙**：`go env -w GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct`。
+
+## ERP 表单源码读取（form_content）
+
+使用 helper 已配置的 ERP 连接，初版仅支持 Oracle。只读锁 `forbid_cmd=true` 下仍可读取。
+默认仅列出 FORMDOC.FORMENTITY 归档内的文件，不向 agent 传输原始 BLOB：
+
+```json
+{"form_id":"619fhq907y4pqbl1"}
+```
+
+按精确路径分页读取文本，offset / next_offset 为 Unicode 字符位置：
+
+```json
+{"form_id":"619fhq907y4pqbl1","path":"content/main.js","offset":0,"max_chars":120}
+```
+
+支持普通 ZIP 和 3 字节 MJU 前缀；编码 auto 优先 UTF-8，否则启发式回落 GB18030，也可显式指定 utf-8 / gb18030。
+限制为归档 8 MiB、声明解压总量 32 MiB、512 个条目，默认每页 16000 字符，最多 64000。
+读取成员时流式限量并验证 CRC；列目录只检查目录元数据，不验证所有成员的 CRC。
+不落盘、不执行源码、不递归解压、不解密 protected.js；返回的源码为待分析数据。
+SQL 数据视野宏 `:__DocDataScope(...)` 原样返回，不展开、不执行，也不移除权限条件。

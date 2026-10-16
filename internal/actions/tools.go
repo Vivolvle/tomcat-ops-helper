@@ -21,6 +21,9 @@ type Tool struct {
 // anything beyond flat objects.
 func (r *Registry) Tools() []Tool {
 	core := coreTools()
+	if r.dbops["erp_db_operator"] != nil {
+		core = append(core, formContentTool)
+	}
 	out := make([]Tool, 0, len(core)+len(r.dbops))
 	out = append(out, core...)
 	for _, def := range dbOpToolDefs {
@@ -117,7 +120,7 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "exec",
-			Description: "Run a single shell command with blacklist and allowed_dirs enforcement, output capped at cfg.max_output_size. Commands may run concurrently. On Windows a timeout terminates the complete child process tree and releases inherited output handles. Default shell is cmd.exe /C on Windows or sh -c on Unix; double-quoted arguments survive verbatim (paths with spaces are safe). For PowerShell cmdlets pass \"shell\":\"powershell\" to run the command as an encoded PowerShell script. For an intentional service/background process, use its service manager or a detached launcher; use kill_pid for a leftover process. Shell redirect/pipes (2>&1, |, &, ;) are NOT supported by exec; for multi-step scripts write a .cmd/.ps1 file via write_file and run that. Use sparingly; prefer named actions.",
+			Description: "Run a single shell command with blacklist and allowed_dirs enforcement, output capped at cfg.max_output_size. Commands may run concurrently. On Windows a timeout terminates the complete child process tree and releases inherited output handles. Default shell is cmd.exe /C on Windows or sh -c on Unix; double-quoted arguments survive verbatim (paths with spaces are safe). For PowerShell cmdlets pass \"shell\":\"powershell\" to run the command as an encoded PowerShell script. For an intentional service/background process, use its service manager or a detached launcher; use kill_pid for a leftover process. Pipes and redirects (|, >, 2>&1) are supported by the selected shell; cmd uses & and PowerShell uses ; for command sequences. Redirect targets must be inside allowed_dirs. For complex scripts write a .cmd/.ps1 via write_file. Use sparingly; prefer named actions.",
 			InputSchema: execSchema,
 		},
 		{
@@ -176,7 +179,8 @@ var restartSchema = json.RawMessage(`{
 	"type":"object",
 	"properties":{
 		"stop_timeout":{"type":"integer","description":"Timeout in seconds for the stop step; defaults to cfg.command_timeout.","minimum":1},
-		"start_timeout":{"type":"integer","description":"Timeout in seconds for the start step; defaults to cfg.command_timeout (same as stop_timeout if not set).","minimum":1}
+		"start_timeout":{"type":"integer","description":"Timeout in seconds for the start step; defaults to cfg.command_timeout (same as stop_timeout if not set).","minimum":1},
+		"async":{"type":"boolean","description":"Return immediately with task_id; restart continues independently of MCP timeout. Poll task_status for result or error."}
 	},
 	"additionalProperties":false
 }`)
@@ -289,7 +293,8 @@ var uploadGuideSchema = json.RawMessage(`{
 	"type": "object",
 	"properties":{
 		"source":{"type":"string","description":"Local file path on the operator machine to upload."},
-		"destination":{"type":"string","description":"Absolute destination path on the helper machine (must be under allowed_dirs)."}
+		"destination":{"type":"string","description":"Absolute destination path on the helper machine (must be under allowed_dirs)."},
+		"server_url":{"type":"string","description":"Operator HTTP bridge base URL; defaults to http://127.0.0.1:7777. This is not the helper WSS relay URL."}
 	},
 	"required":["source","destination"],
 	"additionalProperties":false

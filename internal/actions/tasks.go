@@ -138,13 +138,15 @@ type TaskSummaryData struct {
 
 // TaskStatusData is the full task_status reply for one task.
 type TaskStatusData struct {
-	TaskID    string      `json:"task_id"`
-	Tool      string      `json:"tool"`
-	Done      bool        `json:"done"`
-	Running   bool        `json:"running"`
-	CreatedAt string      `json:"created_at"`
-	UpdatedAt string      `json:"updated_at"`
-	Deploy    *DeployData `json:"deploy,omitempty"`
+	TaskID    string       `json:"task_id"`
+	Tool      string       `json:"tool"`
+	Done      bool         `json:"done"`
+	Running   bool         `json:"running"`
+	CreatedAt string       `json:"created_at"`
+	UpdatedAt string       `json:"updated_at"`
+	Deploy    *DeployData  `json:"deploy,omitempty"`
+	Restart   *RestartData `json:"restart,omitempty"`
+	Error     string       `json:"error,omitempty"`
 }
 
 // taskStatus implements the "task_status" action: with task_id, the full
@@ -185,6 +187,11 @@ func (r *Registry) taskStatus(ctx context.Context, params json.RawMessage) (json
 		CreatedAt: t.Created.UTC().Format(time.RFC3339),
 		UpdatedAt: updated.UTC().Format(time.RFC3339),
 		Deploy:    &data,
+	}
+	if t.Tool == "restart" {
+		out.Deploy = nil
+		out.Restart = data.RestartResult
+		out.Error = data.Error
 	}
 	return mustMarshal(out), nil
 }

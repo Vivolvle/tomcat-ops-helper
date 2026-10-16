@@ -37,8 +37,10 @@ helper.log
 Thumbs.db
 desktop.ini
 
-# Opencode local state
+# Agent local state (opencode / codex). Codex config.toml carries credentials
+# and README.md pins a specific MCP client_id, so the whole directory stays out.
 .opencode/
+.codex/
 
 # Deploy staging bundles live in D:/tools (helper-client,
 # helper-client-2012r2) and carry real tokens — never commit them.

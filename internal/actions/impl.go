@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -450,6 +451,7 @@ func (r *Registry) waitCatalina(ctx context.Context, params json.RawMessage) (js
 
 // DeployData is the JSON returned by "deploy".
 type DeployData struct {
+	RestartResult *RestartData      `json:"restart_result,omitempty"`
 	ServiceName   string            `json:"service_name,omitempty"`
 	StopResult    *StopServiceData  `json:"stop_result,omitempty"`
 	ReplaceResult *ReplaceJarData   `json:"replace_result,omitempty"`
@@ -697,6 +699,37 @@ func (r *Registry) restart(ctx context.Context, params json.RawMessage) (json.Ra
 	if err != nil {
 		return nil, err
 	}
+	if async, _ := p["async"].(bool); !async {
+		return r.restartSync(ctx, params)
+	}
+	t := r.tasks.newTask("restart")
+	t.publish(DeployData{TaskID: t.ID, Step: "restart"})
+	go func() {
+		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Minute)
+		defer cancel()
+		raw, err := r.restartSync(wctx, params)
+		data := DeployData{TaskID: t.ID, Step: "done"}
+		if err != nil {
+			data.Error = err.Error()
+			data.Step = "restart"
+		} else {
+			var result RestartData
+			if err := json.Unmarshal(raw, &result); err != nil {
+				data.Error = err.Error()
+			} else {
+				data.RestartResult = &result
+			}
+		}
+		t.finish(data)
+	}()
+	return mustMarshal(map[string]any{"task_id": t.ID, "tool": "restart", "status": "running", "hint": "poll task_status with this task_id"}), nil
+}
+
+func (r *Registry) restartSync(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	p, err := decodeParams(params)
+	if err != nil {
+		return nil, err
+	}
 	stopTimeout := r.cfg.CommandTimeout
 	if v, ok := p["stop_timeout"].(float64); ok && v > 0 {
 		stopTimeout = time.Duration(v * float64(time.Second))
@@ -895,19 +928,29 @@ func (r *Registry) replaceJar(ctx context.Context, params json.RawMessage) (json
 	if !r.cfg.IsAllowedWorkDir(dstAbs) {
 		return nil, fmt.Errorf("replace_jar: dest not in allowed dir")
 	}
-	// Backup existing dest if it exists.
-	bak := dstAbs + ".bak"
-	if _, err := os.Stat(dstAbs); err == nil {
-		if err := os.Rename(dstAbs, bak); err != nil {
-			return nil, fmt.Errorf("replace_jar: backup: %w", err)
+	// Both paths belong to the helper host. Do not move away an already-uploaded
+	// source that is also the destination (including hard-link aliases).
+	same := srcAbs == dstAbs
+	if a, err := os.Stat(srcAbs); err == nil {
+		if b, err := os.Stat(dstAbs); err == nil {
+			same = same || os.SameFile(a, b)
 		}
 	}
-	if err := copyFile(srcAbs, dstAbs); err != nil {
-		// Try to restore the backup so we don't leave a half-baked app.
-		if _, statErr := os.Stat(bak); statErr == nil {
-			_ = os.Rename(bak, dstAbs)
+	if !same {
+		// Backup existing dest if it exists.
+		bak := dstAbs + ".bak"
+		if _, err := os.Stat(dstAbs); err == nil {
+			if err := os.Rename(dstAbs, bak); err != nil {
+				return nil, fmt.Errorf("replace_jar: backup: %w", err)
+			}
 		}
-		return nil, fmt.Errorf("replace_jar: copy: %w", err)
+		if err := copyFile(srcAbs, dstAbs); err != nil {
+			// Try to restore the backup so we don't leave a half-baked app.
+			if _, statErr := os.Stat(bak); statErr == nil {
+				_ = os.Rename(bak, dstAbs)
+			}
+			return nil, fmt.Errorf("replace_jar: copy: %w", err)
+		}
 	}
 	sum, err := sha256Of(dstAbs)
 	if err != nil {
@@ -1560,25 +1603,21 @@ func (r *Registry) uploadGuide(params json.RawMessage) (json.RawMessage, error) 
 		return nil, fmt.Errorf("upload_guide: %w", err)
 	}
 
-	// Use the server_url from config to derive the upload endpoint.
-	// Default to localhost:7777 if not available.
+	// The WSS relay (often a tunnel) is not the operator's HTTP bridge.
+	// Use the local bridge by default; operators can specify a custom base URL.
 	serverURL := "http://127.0.0.1:7777"
-	if r.cfg.ServerURL != "" {
-		// Extract host:port from server_url (e.g., "wss://example.com:8443" -> "http://example.com:7777")
-		serverURL = r.cfg.ServerURL
-		// Convert wss:// to http://
-		serverURL = strings.Replace(serverURL, "wss://", "http://", 1)
-		serverURL = strings.Replace(serverURL, "ws://", "http://", 1)
-		// Replace the port with 7777 (agent HTTP bridge)
-		if idx := strings.LastIndex(serverURL, ":"); idx > 0 {
-			serverURL = serverURL[:idx] + ":7777"
+	if custom, _ := p["server_url"].(string); custom != "" {
+		u, err := url.Parse(custom)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("upload_guide: server_url must be an HTTP(S) base URL")
 		}
+		serverURL = strings.TrimRight(custom, "/")
 	}
 
 	clientID := r.cfg.ClientID
 
 	// Build curl flags; include client_id when available.
-	curlFlags := fmt.Sprintf("-F 'file=@%s' -F 'path=%s' -F 'sha256=$sha' -F 'overwrite=true'", source, dest)
+	curlFlags := fmt.Sprintf("-F 'file=@%s' -F 'path=%s' -F \"sha256=$sha\" -F 'overwrite=true'", strings.ReplaceAll(source, "'", "''"), strings.ReplaceAll(dest, "'", "''"))
 	if clientID != "" {
 		curlFlags += fmt.Sprintf(" -F 'client_id=%s'", clientID)
 	}
