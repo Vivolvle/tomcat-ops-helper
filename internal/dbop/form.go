@@ -99,12 +99,12 @@ func InspectForm(ctx context.Context, data []byte, path, encoding string, offset
 		return out, errors.New("encoding must be auto, utf-8, or gb18030")
 	}
 	payload := data
-	if bytes.HasPrefix(data, []byte("MJU")) {
-		out.Prefix = "MJU"
+	if bytes.HasPrefix(data, []byte("MJU")) || bytes.HasPrefix(data, []byte("VRS")) {
+		out.Prefix = string(data[:3])
 		payload = data[3:]
 	}
 	if !bytes.HasPrefix(payload, []byte("PK\x03\x04")) && !bytes.HasPrefix(payload, []byte("PK\x05\x06")) {
-		return out, errors.New("expected ZIP or MJU-prefixed ZIP")
+		return out, errors.New("expected ZIP or MJU/VRS-prefixed ZIP")
 	}
 	archive, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
 	if err != nil {

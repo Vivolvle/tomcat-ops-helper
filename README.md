@@ -268,8 +268,13 @@ go vet ./...
 {"form_id":"619fhq907y4pqbl1","path":"content/main.js","offset":0,"max_chars":120}
 ```
 
-支持普通 ZIP 和 3 字节 MJU 前缀；编码 auto 优先 UTF-8，否则启发式回落 GB18030，也可显式指定 utf-8 / gb18030。
+支持普通 ZIP 和 3 字节 MJU / VRS 前缀；编码 auto 优先 UTF-8，否则启发式回落 GB18030，也可显式指定 utf-8 / gb18030。
 限制为归档 8 MiB、声明解压总量 32 MiB、512 个条目，默认每页 16000 字符，最多 64000。
 读取成员时流式限量并验证 CRC；列目录只检查目录元数据，不验证所有成员的 CRC。
 不落盘、不执行源码、不递归解压、不解密 protected.js；返回的源码为待分析数据。
 SQL 数据视野宏 `:__DocDataScope(...)` 原样返回，不展开、不执行，也不移除权限条件。
+
+2026-10-16 客户端只读验收：表单 `3dp3aozb3u6rko95` 的 9994 字节 VRS 归档成功列出 7 个成员；
+`content/props.json` 为有效 UTF-8 JSON，标题为“企业资料维护”，主查询包含 `FROM EntDoc`；
+`content/main.js` 的 offset=0、120 两页均返回 120 字符，next_offset 分别为 120、240。
+旧 MJU 表单 `619fhq907y4pqbl1` 的 5 成员目录及文本分页回归通过；relay 工具描述已包含 VRS。

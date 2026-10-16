@@ -26,7 +26,7 @@ func formArchive(t *testing.T, prefix string, content []byte) []byte {
 	return append([]byte(prefix), b.Bytes()...)
 }
 func TestFormArchive(t *testing.T) {
-	for _, prefix := range []string{"", "MJU"} {
+	for _, prefix := range []string{"", "MJU", "VRS"} {
 		data := formArchive(t, prefix, []byte("你好abc"))
 		result, err := InspectForm(context.Background(), data, "", "auto", 0, 2)
 		if err != nil || len(result.Files) != 1 || result.Text != "" || result.Prefix != prefix {
@@ -35,6 +35,10 @@ func TestFormArchive(t *testing.T) {
 		result, err = InspectForm(context.Background(), data, "content/main.js", "auto", 1, 2)
 		if err != nil || result.Text != "好a" || !result.Truncated || result.NextOffset == nil || *result.NextOffset != 3 {
 			t.Fatalf("page: %+v %v", result, err)
+		}
+		result, err = InspectForm(context.Background(), data, "content/main.js", "auto", 0, 100)
+		if err != nil || result.Text != "你好abc" || result.Truncated || result.TotalChars != 5 {
+			t.Fatalf("full text: %+v %v", result, err)
 		}
 	}
 }
@@ -56,6 +60,10 @@ func TestFormRejectsInvalidInput(t *testing.T) {
 		offset, limit  int
 	}{
 		{[]byte("bad"), "", "auto", 0, 1},
+		{[]byte("VR"), "", "auto", 0, 1},
+		{[]byte("VRS"), "", "auto", 0, 1},
+		{[]byte("VRSnot-zip"), "", "auto", 0, 1},
+		{formArchive(t, "XYZ", []byte("abc")), "", "auto", 0, 1},
 		{data, "missing", "auto", 0, 1},
 		{data, "content/main.js", "auto", 4, 1},
 		{data, "", "auto", -1, 1},
