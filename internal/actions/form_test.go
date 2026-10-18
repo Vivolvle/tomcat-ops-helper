@@ -75,6 +75,20 @@ func TestFormDispatch(t *testing.T) {
 	if out.Prefix != "VRS" || out.Text != "好a" || out.NextOffset == nil || *out.NextOffset != 3 {
 		t.Fatalf("bad VRS page: %s", raw)
 	}
+	for _, prefix := range []string{"JCU", "FHA", "VHS", "XYZ"} {
+		r.WithDB("erp_db_operator", formTestOp{data: append([]byte(prefix), b.Bytes()...)})
+		raw, err := r.Dispatch(context.Background(), "form_content", json.RawMessage(`{"form_id":"619fhq907y4pqbl1","path":"content/main.js","offset":1,"max_chars":2}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var page dbop.FormContent
+		if err := json.Unmarshal(raw, &page); err != nil {
+			t.Fatal(err)
+		}
+		if page.Prefix != prefix || page.Text != "好a" || page.NextOffset == nil || *page.NextOffset != 3 {
+			t.Fatalf("bad %s page: %s", prefix, raw)
+		}
+	}
 	for _, args := range []string{`{"form_id":"bad"}`, `{"form_id":"619fhq907y4pqbl1","offset":0.5}`, `{"form_id":"619fhq907y4pqbl1","max_chars":0}`, `{"form_id":"619fhq907y4pqbl1","encoding":"bad"}`} {
 		if _, err := r.Dispatch(context.Background(), "form_content", json.RawMessage(args)); err == nil {
 			t.Fatalf("accepted %s", args)

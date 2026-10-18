@@ -35,7 +35,9 @@ helper 承载当前 MCP 反向连接；替换或终止它会使 agent 与客户�
 | MJU + ZIP | `619fhq907y4pqbl1` | 机构批号结存查询 | 5904 | 5 | `4D4A55504B0304` |
 | VRS + ZIP | `3dp3aozb3u6rko95` | 企业资料维护（`race.base.ent.entdoc`） | 9994 | 7 | `565253504B0304` |
 
-MJU/VRS 均为 **3 字节 ASCII 前缀**，后面的 `PK` 属于 ZIP 头。另支持无前缀普通 ZIP。新增格式时应先查询实际头部，再显式识别已证实的前缀；未知前缀仍拒绝，不任意扫描 PK 猜偏移。
+FORMENTITY 支持无前缀普通 ZIP，或任意三个大写 ASCII 字母（A–Z）紧接有效 ZIP；MJU/VRS/JCU/FHA/VHS 只是示例，不维护前缀白名单。仅检查偏移 0 或 3 的 ZIP 签名（PK 03 04 / PK 05 06），再使用标准 ZIP 解析器校验结构；读取成员时解压并验证 CRC。拒绝其他长度、字符格式和损坏载荷，不扫描任意 PK 偏移。目录列举成功不表示所有成员 CRC 已验证。
+
+2026-10-18 新版 helper 已通过真实 MCP 在 `BFDHERP` 验证 JCU（`0flh47h83eioilig`，7 成员）、FHA（`3akefm3d9f42p08o`，6 成员）、VHS（`0czyzzfdchc1iebu`，7 成员），并回归上述 MJU/VRS。五个归档的 32 个成员均完整读取并通过 CRC、UTF-8 字节长度核对和 props.json 解析；main.js 两页 Unicode 分页通过，protected.js 未解密警告正常。未写数据库或执行源码。
 
 只读回归步骤（工具前缀以当前会话为准）：
 
@@ -43,7 +45,7 @@ MJU/VRS 均为 **3 字节 ASCII 前缀**，后面的 `PK` 属于 ZIP 头。另�
 2. 两个归档均包含 `content/main.xul`、`content/props.json`、`content/main.js`、`content/desc.html`。MJU 样本另有 `content/protected.js`；VRS 样本另有 `locale/default/form.properties`、`locale/en/form.properties`、`locale/zh_TW/form.properties`。
 3. 对两个 ID 读取 `content/main.js`，参数 `offset=0,max_chars=120`：断言 Unicode 字符数为 120、truncated=true、next_offset=120；再以 offset=120 读取，断言 next_offset=240。勿按 UTF-8 字节计数。
 4. VRS 样本读取 `content/props.json`（max_chars=16000）：UTF-8、有效 JSON、不截断，`__form.caption` 为“企业资料维护”，`__sqlmacros.uf_query_sql.sql` 包含 `FROM EntDoc`。SQL 只作文本断言，不执行，不展开数据视野宏。
-5. 新格式必须同时保留普通 ZIP/MJU/VRS 的无库目录、全文、Unicode 分页测试，以及残缺/未知前缀、CRC、大小限制和取消等已有回归。用户本人更新客户 helper 后，再做上述真实工具链只读验收。
+5. 新格式必须同时保留普通 ZIP/MJU/VRS 的无库目录、全文、Unicode 分页测试，并覆盖 JCU/FHA/VHS/XYZ，以及残缺载荷、错误长度/字符标签、伪 ZIP、CRC、大小限制和取消等回归。用户本人更新客户 helper 后，再做上述真实工具链只读验收。
 
 需要核对样本存在性或头部时，通过 `erp_db_operator` 使用有 FORMID 条件的只读 SQL：
 

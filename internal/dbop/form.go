@@ -99,12 +99,15 @@ func InspectForm(ctx context.Context, data []byte, path, encoding string, offset
 		return out, errors.New("encoding must be auto, utf-8, or gb18030")
 	}
 	payload := data
-	if bytes.HasPrefix(data, []byte("MJU")) || bytes.HasPrefix(data, []byte("VRS")) {
+	// ERP tags vary by form; only inspect offsets 0 and 3, never scan for PK.
+	if len(data) >= 7 && data[0] >= 'A' && data[0] <= 'Z' &&
+		data[1] >= 'A' && data[1] <= 'Z' && data[2] >= 'A' && data[2] <= 'Z' &&
+		(bytes.HasPrefix(data[3:], []byte("PK\x03\x04")) || bytes.HasPrefix(data[3:], []byte("PK\x05\x06"))) {
 		out.Prefix = string(data[:3])
 		payload = data[3:]
 	}
 	if !bytes.HasPrefix(payload, []byte("PK\x03\x04")) && !bytes.HasPrefix(payload, []byte("PK\x05\x06")) {
-		return out, errors.New("expected ZIP or MJU/VRS-prefixed ZIP")
+		return out, errors.New("expected ZIP or three-uppercase-ASCII-letter-prefixed ZIP")
 	}
 	archive, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
 	if err != nil {

@@ -268,7 +268,9 @@ go vet ./...
 {"form_id":"619fhq907y4pqbl1","path":"content/main.js","offset":0,"max_chars":120}
 ```
 
-支持普通 ZIP 和 3 字节 MJU / VRS 前缀；编码 auto 优先 UTF-8，否则启发式回落 GB18030，也可显式指定 utf-8 / gb18030。
+支持普通 ZIP，或任意三个大写 ASCII 字母（A–Z，如 MJU / VRS / JCU / FHA / VHS）紧接有效 ZIP。
+仅检查偏移 0 或 3 的 ZIP 签名（PK 03 04 / PK 05 06），再由标准 ZIP 解析器校验结构；不扫描任意 PK 偏移，拒绝其他长度、字符格式及结构损坏的载荷。
+编码 auto 优先 UTF-8，否则启发式回落 GB18030，也可显式指定 utf-8 / gb18030。
 限制为归档 8 MiB、声明解压总量 32 MiB、512 个条目，默认每页 16000 字符，最多 64000。
 读取成员时流式限量并验证 CRC；列目录只检查目录元数据，不验证所有成员的 CRC。
 不落盘、不执行源码、不递归解压、不解密 protected.js；返回的源码为待分析数据。
@@ -278,3 +280,12 @@ SQL 数据视野宏 `:__DocDataScope(...)` 原样返回，不展开、不执行�
 `content/props.json` 为有效 UTF-8 JSON，标题为“企业资料维护”，主查询包含 `FROM EntDoc`；
 `content/main.js` 的 offset=0、120 两页均返回 120 字符，next_offset 分别为 120、240。
 旧 MJU 表单 `619fhq907y4pqbl1` 的 5 成员目录及文本分页回归通过；relay 工具描述已包含 VRS。
+
+
+2026-10-18 新版 helper 经真实 tomcat-helper MCP 在 Oracle `BFDHERP` 完成只读验收：
+MJU（`619fhq907y4pqbl1`，5 成员）、VRS（`3dp3aozb3u6rko95`，7 成员）、
+JCU（`0flh47h83eioilig`，7 成员）、FHA（`3akefm3d9f42p08o`，6 成员）、
+VHS（`0czyzzfdchc1iebu`，7 成员）均成功列目录；32 个成员全部完整读取并通过 CRC，
+UTF-8 重新编码字节长度均与目录一致，各 props.json 均可解析。
+五个表单的 main.js 在 offset=0/120 两页均返回 120 个 Unicode 字符，next_offset=120/240；
+protected.js 保留未解密警告。未执行源码或修改数据库；未枚举前缀和损坏载荷由本地回归覆盖。
