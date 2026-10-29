@@ -64,8 +64,8 @@ func TestClient_ConnectsAndDispatches(t *testing.T) {
 	defer srv.Close()
 
 	c, err := New(Options{
-		URL:               wsURL,
-		Token:             "secret-12345",
+		URL:                wsURL,
+		Token:              "secret-12345",
 		InsecureSkipVerify: true,
 		Hello: func() protocol.Hello {
 			return protocol.Hello{ClientID: "c1", Token: "secret-12345", Hostname: "h", Version: "t"}
@@ -160,10 +160,10 @@ func TestClient_ReconnectsAfterServerDrop(t *testing.T) {
 	defer srv.Close()
 
 	c, _ := New(Options{
-		URL:               wsURL,
-		Token:             "ok",
+		URL:                wsURL,
+		Token:              "ok",
 		InsecureSkipVerify: true,
-		Hello:             func() protocol.Hello { return protocol.Hello{ClientID: "x", Token: "ok"} },
+		Hello:              func() protocol.Hello { return protocol.Hello{ClientID: "x", Token: "ok"} },
 		Handler: func(ctx context.Context, cmd protocol.Command) protocol.Result {
 			return protocol.Result{}
 		},
@@ -202,6 +202,70 @@ func TestNew_RequiresFields(t *testing.T) {
 		if _, err := New(o); err == nil {
 			t.Fatalf("case %d: expected error", i)
 		}
+	}
+}
+
+// Concurrent replies, tool-list pushes and heartbeats share one writer.
+func TestClient_ConcurrentWrites(t *testing.T) {
+	const count = 200
+	received := make(chan int, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for i := 0; i < count+1; i++ {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				received <- i
+				return
+			}
+		}
+		received <- count + 1
+	})
+	srv, wsURL := newTestServer(t, mux)
+	defer srv.Close()
+	c, err := New(Options{URL: wsURL, Hello: func() protocol.Hello { return protocol.Hello{} }, Handler: func(context.Context, protocol.Command) protocol.Result { return protocol.Result{} }, HeartbeatInterval: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c.mu.Lock()
+		connected := c.conn != nil
+		c.mu.Unlock()
+		if connected {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connection timeout")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.PushToolList(nil); err != nil {
+				t.Errorf("push: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case n := <-received:
+		if n != count+1 {
+			t.Fatalf("received %d frames", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out receiving frames")
 	}
 }
 

@@ -50,8 +50,8 @@ func coreTools() []Tool {
 	return []Tool{
 		httpCallTool,
 		{Name: "list_exec", Description: "List currently running helper shell commands with PID, arguments, working directory and start time. Use kill_pid to stop a command.", InputSchema: emptyObjectSchema},
-		{Name: "read_file", Description: "Read an existing UTF-8 text file in allowed_dirs, up to 1 MiB. Returns exact text and SHA256. Local editor tools cannot read remote helper files.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`)},
-		{Name: "replace_text", Description: "Atomically replace literal text in an existing UTF-8 file in allowed_dirs, up to 1 MiB. Preserves BOM and line endings. Default expected_count=1; mismatch leaves file unchanged. Optional expected_sha256 checks the version read earlier.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"expected_count":{"type":"integer","minimum":1},"expected_sha256":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}`)},
+		{Name: "read_file", Description: "Read an existing UTF-8 text file in allowed_dirs, up to 1 MiB. Returns exact text and SHA256. Local editor tools cannot read remote helper files. Independent reads may be requested concurrently; coordinate with writers when a consistent version is needed.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`)},
+		{Name: "replace_text", Description: "Atomically replace literal text in an existing UTF-8 file in allowed_dirs, up to 1 MiB. Preserves BOM and line endings. Default expected_count=1; mismatch leaves file unchanged. Use expected_sha256 from read_file to detect a stale version. Coordinate writes to the same file sequentially, including writes via other tools or processes. For parallel agent work, use separate files and have one owner merge and verify the results after all workers finish; do not assume the hash check protects against external concurrent writers.", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"expected_count":{"type":"integer","minimum":1},"expected_sha256":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}`)},
 		{
 			Name:        "status",
 			Description: "Return hostname, OS, Tomcat home existence, JVM processes (filtered to Tomcat/catalina, including prunsrv-hosted service JVMs such as tomcat10-esb.exe), and listening TCP ports. If a probe fails, its section stays empty and the reason is reported in java_probe_error / ports_probe_error instead of failing the whole call.",
@@ -125,12 +125,12 @@ func coreTools() []Tool {
 		},
 		{
 			Name:        "write_file",
-			Description: "Write UTF-8 text to a file under allowed_dirs. No BOM. Atomic via tmp+rename. Refuses to overwrite an existing file unless overwrite=true. Returns bytes_written and sha256.",
+			Description: "Write UTF-8 text to a file under allowed_dirs. No BOM. Atomic via tmp+rename. Refuses to overwrite an existing file unless overwrite=true. Returns bytes_written and sha256. Coordinate writes to the same file sequentially, including writes via other tools or processes. For parallel agent work, use separate files and have one owner merge and verify the results after all workers finish. Atomic replacement does not prevent lost updates from concurrent writers.",
 			InputSchema: writeFileSchema,
 		},
 		{
 			Name:        "append_text_file",
-			Description: "Append UTF-8 text to a small file under allowed_dirs. Creates parent directories and the file when missing, writes no BOM, fsyncs before returning, and reports appended and total bytes.",
+			Description: "Append UTF-8 text to a small file under allowed_dirs. Creates parent directories and the file when missing, writes no BOM, fsyncs before returning, and reports appended and total bytes. Coordinate writes to the same file sequentially, including writes via other tools or processes; do not rely on concurrent appends having a predictable order. For parallel agent work, use separate files and have one owner merge and verify the results after all workers finish.",
 			InputSchema: appendTextFileSchema,
 		},
 		{

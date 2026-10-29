@@ -53,6 +53,7 @@ type Options struct {
 type Client struct {
 	opts    Options
 	mu      sync.Mutex
+	writeMu sync.Mutex
 	conn    *websocket.Conn
 	closed  atomic.Bool
 	current atomic.Pointer[protocol.Hello]
@@ -152,7 +153,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return fmt.Errorf("send hello: %w", err)
 	}
 	if c.opts.PostConnect != nil {
-		if err := c.opts.PostConnect(conn); err != nil {
+		if err := c.opts.PostConnect(jsonWriter{client: c, conn: conn}); err != nil {
 			return fmt.Errorf("post-connect: %w", err)
 		}
 	}
@@ -237,8 +238,7 @@ func (c *Client) heartbeat(conn *websocket.Conn, stop <-chan struct{}, done chan
 			if cur == nil || cur != conn {
 				return
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.writeMessage(conn, websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
@@ -246,15 +246,29 @@ func (c *Client) heartbeat(conn *websocket.Conn, stop <-chan struct{}, done chan
 }
 
 func (c *Client) writeJSON(conn *websocket.Conn, v any) error {
-	if c.opts.WriteTimeout > 0 {
-		_ = conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout))
-	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return conn.WriteMessage(websocket.TextMessage, b)
+	return c.writeMessage(conn, websocket.TextMessage, b)
 }
+
+// Gorilla permits only one concurrent data writer, including deadline changes.
+func (c *Client) writeMessage(conn *websocket.Conn, kind int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(kind, data)
+}
+
+type jsonWriter struct {
+	client *Client
+	conn   *websocket.Conn
+}
+
+func (w jsonWriter) WriteJSON(v any) error { return w.client.writeJSON(w.conn, v) }
 
 // Current returns the latest Hello sent to the server, if any.
 func (c *Client) Current() (protocol.Hello, bool) {
